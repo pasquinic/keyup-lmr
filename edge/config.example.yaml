@@ -1,0 +1,44 @@
+# /etc/lmr-edge/config.yaml -- bootstrap + local hardware only.
+# Channels (frequencies, modes, talkgroups, GPIO pins, sound cards) are managed
+# centrally in the web UI and pushed to this device; they are cached locally so
+# the site keeps working in SITE TRUNKING if the central server is unreachable.
+
+server_url: __SERVER__          # public enrollment URL (https)
+enrollment_token: __TOKEN__     # one-time token from Edge Devices & Enrollment
+state_dir: /var/lib/lmr-edge
+radio_backend: __BACKEND__      # gpio (real radios) | sim (lab)
+log_level: INFO
+
+wireguard:
+  enabled: true
+  interface: lmr0
+  config_dir: /etc/wireguard
+
+# Optional DVSI AMBE-3000 USB vocoder (ThumbDV / USB-3000) so this site can send
+# native IMBE / AMBE+2 over the tunnel instead of G.711 (saves ~55 kbps per call).
+vocoder:
+  dvsi_ports: []                # e.g. [/dev/ttyUSB0]
+  baud: 460800
+
+local_api:
+  host: 127.0.0.1
+  port: 8090
+
+site_trunking:
+  timeout_s: null               # null = central system setting (default 10 s)
+  local_repeat: true            # cross-patch local channels that share a talkgroup
+  post_call_tone: true          # site-trunking tone after each local call
+  announce_tone: true           # tone on all channels when entering/leaving site trunking
+
+notifications:
+  data:
+    enabled: true
+    # radio  = through the radio backend's data path (implement send_data for your radio)
+    # serial = write `template` to a serial data port on the base radio / repeater
+    method: serial
+    targets: [talkgroups, subscribers]   # group message per TG and/or each subscriber assigned to this site
+    serial_port: /dev/ttyUSB1
+    serial_baud: 9600
+    template: "MSG,{target_type},{target_id},{text}\r\n"
+  gpio_indicator: null          # BCM pin held high while in site trunking (LED / alarm)
+  webhook: ""                   # optional URL POSTed on mode change

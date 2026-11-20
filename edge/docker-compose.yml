@@ -1,0 +1,23 @@
+# Edge agent as a container on the Pi. Needs host networking (WireGuard + UDP voice),
+# NET_ADMIN for the tunnel, and access to GPIO + sound cards.
+services:
+  lmr-edge:
+    build:
+      context: ..
+      dockerfile: edge/Dockerfile
+    restart: unless-stopped
+    network_mode: host
+    cap_add: [NET_ADMIN, SYS_NICE]
+    devices:
+      - /dev/gpiochip0
+      - /dev/gpiochip4      # Pi 5 header GPIO (remove on Pi 4)
+      - /dev/snd
+      # - /dev/ttyUSB0      # DVSI vocoder
+      # - /dev/ttyUSB1      # radio data port (site-trunking messages)
+    volumes:
+      - /etc/lmr-edge:/etc/lmr-edge
+      - /var/lib/lmr-edge:/var/lib/lmr-edge
+      - /etc/wireguard:/etc/wireguard
+      - /lib/modules:/lib/modules:ro
+    # In a container, bring the tunnel up with wg-quick on the host (systemctl enable wg-quick@lmr0)
+    # or run `wg-quick up lmr0` in the container -- install.sh does the former on bare metal.

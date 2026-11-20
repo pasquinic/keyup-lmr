@@ -1,0 +1,67 @@
+# KeyUp -- central server stack (Ubuntu Server 22.04/24.04 + Docker Engine)
+#
+#   cp .env.example .env   # edit secrets + public hostname
+#   docker compose up -d --build
+#
+# central and asterisk use host networking: central owns the kernel WireGuard
+# interface and the UDP voice port, Asterisk needs direct RTP/SIP.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lmr
+      POSTGRES_USER: lmr
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lmr -d lmr"]
+      interval: 5s
+      retries: 20
+
+  central:
+    build:
+      context: .
+      dockerfile: central/Dockerfile
+    restart: unless-stopped
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://lmr:${POSTGRES_PASSWORD}@127.0.0.1:5432/lmr
+    volumes:
+      - ./data:/data
+      - /lib/modules:/lib/modules:ro
+    # Hardware transcoding: pass DVSI AMBE-3000 USB vocoders through and list them in DVSI_PORTS
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+    #   - /dev/ttyUSB1:/dev/ttyUSB1
+    depends_on:
+      db:
+        condition: service_healthy
+
+  asterisk:
+    build: ./asterisk
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ./asterisk/conf:/etc/asterisk/custom:ro
+    profiles: ["sip"]   # enable with: docker compose --profile sip up -d
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+
+volumes:
+  pgdata:
+  caddy_data:

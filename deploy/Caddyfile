@@ -1,0 +1,14 @@
+# TLS front door for the management UI and edge enrollment.
+# Automatic HTTPS via Let's Encrypt for {$PUBLIC_HOSTNAME} (ports 80/443 must reach this host).
+{$PUBLIC_HOSTNAME} {
+	encode gzip
+	reverse_proxy 127.0.0.1:8080
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+	}
+	# The edge control websocket is only served inside the WireGuard tunnel
+	@edgews path /edge/ws
+	respond @edgews 403
+}

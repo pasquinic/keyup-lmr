@@ -1,0 +1,19 @@
+[Unit]
+Description=KeyUp LMR edge base-processing agent
+After=network-online.target wg-quick@lmr0.service sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lmr-edge/edge
+Environment=PYTHONPATH=/opt/lmr-edge:/opt/lmr-edge/edge
+ExecStart=/opt/lmr-edge/venv/bin/python -m lmr_edge -c /etc/lmr-edge/config.yaml
+Restart=always
+RestartSec=2
+# real-time-ish scheduling for audio
+Nice=-10
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=20
+
+[Install]
+WantedBy=multi-user.target

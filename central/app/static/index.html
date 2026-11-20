@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KeyUp — LMR Trunking</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="login" class="login hidden">
+  <form id="loginForm" class="card">
+    <div class="brand big"><span class="dot"></span>KEY<b>UP</b></div>
+    <p class="muted">Distributed LMR trunking · key up anywhere</p>
+    <label>Username<input name="username" autocomplete="username" required></label>
+    <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+    <button class="btn primary" type="submit">Sign in</button>
+    <p id="loginErr" class="err"></p>
+  </form>
+</div>
+
+<div id="shell" class="shell hidden">
+  <aside id="nav">
+    <div class="brand"><span class="dot"></span>KEY<b>UP</b></div>
+    <nav>
+      <a href="#/dashboard" data-page="dashboard">Dashboard</a>
+      <a href="#/sites" data-page="sites">Sites</a>
+      <a href="#/devices" data-page="devices">Edge Devices &amp; Enrollment</a>
+      <a href="#/channels" data-page="channels">Channels &amp; Frequencies</a>
+      <a href="#/talkgroups" data-page="talkgroups">Talkgroups</a>
+      <a href="#/subscribers" data-page="subscribers">Subscriber Radios</a>
+      <a href="#/sip" data-page="sip">SIP Interconnect</a>
+      <a href="#/calls" data-page="calls">Call History</a>
+      <a href="#/settings" data-page="settings">System Settings</a>
+    </nav>
+    <div class="navfoot"><span id="liveDot" class="live off"></span><span id="liveTxt">offline</span>
+      <button id="logout" class="btn ghost sm">Sign out</button></div>
+  </aside>
+  <main>
+    <header><button id="menuBtn" class="btn ghost sm">☰</button><h1 id="pageTitle">Dashboard</h1><span id="sysName" class="muted"></span></header>
+    <section id="page"></section>
+  </main>
+</div>
+
+<dialog id="modal"><form method="dialog" id="modalForm"></form></dialog>
+<div id="toast" class="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
