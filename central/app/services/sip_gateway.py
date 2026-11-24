@@ -9,6 +9,11 @@ Each SIP call becomes a SipLeg endpoint on one talkgroup:
   * inbound:  dial the talkgroup's `sip_extension` (or its TGID)
   * outbound: POST /api/sip/originate or a SipRoute with auto_connect=true
 
+With the DVM backend each SIP-enabled talkgroup has an interconnect dvmbridge
+(dvm.py) reached through the talkgroup audio hub (tg_audio.py); phone audio goes
+to it only while the phone is keyed, and the bridge's audio goes to every phone
+on that talkgroup. DVM does the vocoding and call routing.
+
 Floor control for the phone side (phones have no PTT):
   * dtmf mode: press * to key up, # to unkey
   * vox mode:  voice-activated with a hang time
@@ -81,12 +86,17 @@ class SipLeg(Endpoint):
 
     # radio -> phone
     def send_frame(self, frame: VoiceFrame) -> None:
-        if not self.transport or not self.peer or not frame.payload or self.call_id:
+        if not frame.payload or self.call_id:
+            return
+        self.send_ulaw(frame.payload[:160])
+
+    def send_ulaw(self, payload: bytes) -> None:
+        if not self.transport or not self.peer:
             return
         self.seq = (self.seq + 1) & 0xFFFF
-        self.ts = (self.ts + 160) & 0xFFFFFFFF
+        self.ts = (self.ts + len(payload)) & 0xFFFFFFFF
         hdr = RTP_HDR.pack(0x80, 0, self.seq, self.ts, self.ssrc)
-        self.transport.sendto(hdr + frame.payload[:160], self.peer)
+        self.transport.sendto(hdr + payload, self.peer)
 
     # phone -> radio
     def on_rtp(self, payload: bytes) -> None:
@@ -98,12 +108,25 @@ class SipLeg(Endpoint):
             self.vox_last = time.time()
         if not self.call_id:
             return
+        if self.gw.dvm:
+            self.gw.hub.push(self.tg, self.key, audio.ulaw_to_pcm(payload))
+            return
         self.tx_seq = (self.tx_seq + 1) & 0xFFFF
         f = VoiceFrame(FrameType.VOICE, Codec.ULAW, 0, self.call_id, self.tg, 0, self.tx_seq, 0, payload)
         self.gw.ctl.route_frame(self.key, f)
 
     async def key_up(self) -> None:
         if self.call_id or self.requesting:
+            return
+        if self.gw.dvm:  # DVM: the interconnect bridge starts the call; the FNE arbitrates collisions
+            reason = await self.gw.hub.start_tx(self.tg, self.key, 0)
+            if reason:
+                await self.gw.play_tone(self.channel_id, "busy")
+                return
+            self.call_id = 1
+            self.vox_last = time.time()
+            if self.ptt_mode == "vox":
+                asyncio.get_running_loop().create_task(self._vox_watch())
             return
         self.requesting = True
         try:
@@ -121,7 +144,10 @@ class SipLeg(Endpoint):
     async def dekey(self) -> None:
         if self.call_id:
             cid, self.call_id = self.call_id, 0
-            await self.gw.ctl.source_ended(cid, self.key)
+            if self.gw.dvm:
+                self.gw.hub.stop_tx(self.tg, self.key)
+            else:
+                await self.gw.ctl.source_ended(cid, self.key)
 
     async def _vox_watch(self) -> None:
         while self.call_id:
@@ -133,6 +159,10 @@ class SipLeg(Endpoint):
         if call.call_id == self.call_id:
             self.call_id = 0
 
+    def on_audio(self, tg: int, src: int, pcm: bytes) -> None:  # tg_audio.Listener (DVM)
+        if not self.call_id:
+            self.send_ulaw(audio.pcm_to_ulaw(pcm))
+
 
 class SipGateway:
     def __init__(self, ctl: CallController):
@@ -142,6 +172,14 @@ class SipGateway:
                                       auth=(settings.ari_user, settings.ari_password), timeout=5)
         self.connected = False
         self._ports = set()
+
+    @property
+    def dvm(self) -> bool:
+        return self.ctl.fne is not None
+
+    @property
+    def hub(self):
+        return self.ctl.hub
 
     async def _post(self, path: str, **params):
         r = await self.http.post(path, params=params)
@@ -250,6 +288,13 @@ class SipGateway:
             await self.stop_leg(cid, leg)
             return
         self.legs[cid] = leg
+        if self.dvm:
+            if not await self.hub.subscribe(tg, leg):
+                log.warning("TG %d has no interconnect bridge (license not acknowledged?)", tg)  # in DVM mode the leg is not a KeyUp routing endpoint
+            await self.play_tone(cid, "ok")
+            bus.publish("sip_leg", action="up", tg=tg, caller=caller)
+            log.info("SIP leg %s (%s) joined TG %d via dvmbridge [%s]", cid, caller, tg, mode)
+            return
         self.ctl.sip_legs[leg.key] = leg
         call = self.ctl.calls.get(self.ctl.tg_calls.get(tg, -1))
         if call:  # join an in-progress call
@@ -264,6 +309,8 @@ class SipGateway:
         if not leg:
             return
         await leg.dekey()
+        if self.dvm:
+            self.hub.unsubscribe_all(leg.key)
         self.ctl.sip_legs.pop(leg.key, None)
         for call in self.ctl.calls.values():
             call.dests.pop(leg.key, None)

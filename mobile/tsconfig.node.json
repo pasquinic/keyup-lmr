@@ -1,0 +1,9 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "types": ["node"],
+    "noEmit": true
+  },
+  "include": ["__tests__/**/*.ts", "scripts/**/*.ts", "src/client.ts", "src/protocol.ts", "src/g711.ts", "src/dsp.ts"]
+}

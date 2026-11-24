@@ -16,9 +16,9 @@ from lmrcommon.modes import MODE_CODEC, MODE_LABELS, SystemMode
 from . import schemas as S
 from .config import settings
 from .db import get_db
-from .models import (BandPlanEntry, CallRecord, Channel, EdgeDevice, EnrollmentToken, SipRoute, Site, Subscriber,
-                     SystemSetting, TalkGroup, TalkgroupPatch, User, now)
-from .services import rules
+from .models import (CallRecord, Channel, EdgeDevice, EnrollmentToken, IdenEntry, Patch, PocDevice, SipRoute,
+                     Site, Subscriber, SystemSetting, TalkGroup, User, now)
+from .services import dvm, rules
 from .security import current_user, hash_secret, issue_token, verify_secret
 from .services.call_controller import get_system_settings
 from .services.events import bus
@@ -31,8 +31,18 @@ admin = [Depends(current_user)]
 
 
 async def changed():
+    if state.fne is not None:
+        try:
+            await dvm.apply(state.fne)
+        except Exception as e:  # never block a UI save on config generation
+            import logging
+            logging.getLogger("api").exception("DVM apply failed: %s", e)
     if state.ctl:
         await state.ctl.push_all_configs()
+    if state.ctl and state.ctl.hub:
+        state.ctl.hub.refresh()
+    if state.poc:
+        await state.poc.refresh()
 
 
 # ============================================================== auth
@@ -68,6 +78,16 @@ def _get_or_404(db, model, pk):
     return obj
 
 
+def _fixup(db, obj) -> None:
+    """Model-specific defaults/validation shared by create and update."""
+    if isinstance(obj, Channel):
+        if not obj.peer_id:
+            obj.peer_id = dvm.default_peer_id(obj.site_id, obj.slot)
+        clash = db.query(Channel).filter(Channel.peer_id == obj.peer_id, Channel.id != obj.id).first()
+        if clash:
+            raise HTTPException(409, f"peer id {obj.peer_id} already used by channel {clash.name}")
+
+
 def crud(path: str, model, schema, order=None, pk_in_body=True):
     @router.get(f"/{path}", dependencies=admin, name=f"list_{path}")
     def list_(db: Session = Depends(get_db)):
@@ -82,6 +102,7 @@ def crud(path: str, model, schema, order=None, pk_in_body=True):
         if pk_in_body and db.get(model, data["id"]):
             raise HTTPException(409, f"id {data['id']} already exists")
         obj = model(**data)
+        _fixup(db, obj)
         db.add(obj)
         db.commit()
         await changed()
@@ -93,6 +114,7 @@ def crud(path: str, model, schema, order=None, pk_in_body=True):
         for k, v in body.model_dump().items():
             if k != "id":
                 setattr(obj, k, v)
+        _fixup(db, obj)
         db.commit()
         await changed()
         return obj.to_dict()
@@ -109,8 +131,8 @@ crud("sites", Site, S.SiteIn, Site.id)
 crud("talkgroups", TalkGroup, S.TalkGroupIn, TalkGroup.id)
 crud("channels", Channel, S.ChannelIn, Channel.site_id, pk_in_body=False)
 crud("sip/routes", SipRoute, S.SipRouteIn, SipRoute.id, pk_in_body=False)
-crud("bandplan", BandPlanEntry, S.BandPlanIn, BandPlanEntry.id)
-crud("patches", TalkgroupPatch, S.PatchIn, TalkgroupPatch.id, pk_in_body=False)
+crud("idens", IdenEntry, S.IdenIn, IdenEntry.id)
+crud("patches", Patch, S.PatchIn, Patch.id, pk_in_body=False)
 
 
 # subscribers need the talkgroup many-to-many
@@ -182,8 +204,8 @@ def frequency_plan(db: Session = Depends(get_db)):
     """System-wide frequency plan with simple conflict detection."""
     chans = db.query(Channel).order_by(Channel.tx_mhz).all()
     sites = {s.id: s.name for s in db.query(Site).all()}
+    idens = [i.to_dict() for i in db.query(IdenEntry).order_by(IdenEntry.id).all()]
     tx = Counter(round(c.tx_mhz, 5) for c in chans if c.tx_mhz)
-    plan = [b.to_dict() for b in db.query(BandPlanEntry).all()]
     rows = []
     for c in chans:
         warn = []
@@ -191,10 +213,13 @@ def frequency_plan(db: Session = Depends(get_db)):
             warn.append("TX frequency reused at another site/slot (check spacing & simulcast intent)")
         if c.rx_mhz and c.tx_mhz and abs(c.rx_mhz - c.tx_mhz) < 0.0001 and c.mode != "ANALOG":
             warn.append("simplex: RX = TX")
-        slot = rules.locate_channel(c.tx_mhz, c.rx_mhz, plan) if plan else rules.ChannelSlot(None, 0, [])
+        slot = rules.locate_channel(c.tx_mhz, c.rx_mhz, idens) if idens else rules.ChannelSlot(None, 0, [])
+        if c.mode == "P25P2" and _backend(db) == "dvm":
+            warn.append("P25 Phase II is not supported by DVM")
         rows.append({**c.to_dict(), "site_name": sites.get(c.site_id, "?"),
                      "codec": MODE_CODEC[SystemMode(c.mode)].name, "warnings": warn + slot.problems,
-                     "identity": slot.identity, "channel_no": slot.number})
+                     "identity": slot.identity, "channel_no": slot.number,
+                     "iden": slot.identity, "ch_no": slot.number})
     return rows
 
 
@@ -203,9 +228,9 @@ def _checks(db) -> list[dict]:
     return rules.config_checks([x.to_dict() for x in db.query(Site).all()],
                                [x.to_dict() for x in db.query(Channel).all()],
                                [x.to_dict() for x in db.query(TalkGroup).all()],
-                               [x.to_dict() for x in db.query(TalkgroupPatch).all()],
-                               [x.to_dict() for x in db.query(BandPlanEntry).all()],
-                               [x.to_dict() for x in db.query(EdgeDevice).all()])
+                               [x.to_dict() for x in db.query(Patch).all()],
+                               [x.to_dict() for x in db.query(IdenEntry).all()],
+                               [x.to_dict() for x in db.query(EdgeDevice).all()], _backend(db))
 
 
 @router.get("/network", dependencies=admin)
@@ -231,6 +256,30 @@ def network_preview(site_id: int, db: Session = Depends(get_db)):
     """The configuration KeyUp pushes to a site's edge device."""
     _get_or_404(db, Site, site_id)
     return state.ctl.build_config(db, site_id)
+
+
+def _backend(db) -> str:
+    return get_system_settings(db).get("call_backend", "dvm")
+
+
+# ============================================================== DVM
+@router.get("/dvm/status", dependencies=admin)
+def dvm_status(db: Session = Depends(get_db)):
+    plan = dvm.DvmPlan(db)
+    central = plan.central_instances() if plan.ack else {}
+    for sid in plan.sites:
+        plan.site_instances(sid)  # collects warnings
+    return {"backend": _backend(db), "license_acknowledged": plan.ack, "dvm_ref": dvm.DVM_REF,
+            "fne": state.fne.status() if state.fne else None,
+            "central_instances": sorted(central), "warnings": plan.warnings}
+
+
+@router.get("/dvm/preview", dependencies=admin)
+def dvm_preview(site_id: int | None = None, db: Session = Depends(get_db)):
+    """Show the generated DVM files (FNE when site_id is omitted)."""
+    plan = dvm.DvmPlan(db)
+    inst = plan.site_instances(site_id) if site_id else plan.central_instances()
+    return {name: {"binary": i["binary"], "args": i["args"], "files": i["files"]} for name, i in inst.items()}
 
 
 # ============================================================== settings
@@ -402,6 +451,69 @@ def enroll_status(body: dict, db: Session = Depends(get_db)):
     return resp
 
 
+# ============================================================== PoC provisioning
+_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+@router.post("/subscribers/{pk}/poc/activation", dependencies=admin)
+async def poc_activation(pk: int, db: Session = Depends(get_db)):
+    """Enable PoC for a radio ID and issue a one-time activation code (+ QR) for the phone app."""
+    import segno
+    sub = _get_or_404(db, Subscriber, pk)
+    code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(8))
+    sub.poc_enabled = True
+    sub.poc_activation_hash = hash_secret(code)
+    sub.poc_activation_expires = now() + dt.timedelta(hours=24)
+    db.commit()
+    uri = f"keyup://activate?s={settings.public_url}&u={sub.id}&c={code}"
+    await changed()
+    return {"unit": sub.id, "alias": sub.alias, "code": code, "server": settings.public_url, "uri": uri,
+            "expires_at": sub.poc_activation_expires.isoformat() + "Z",
+            "qr_svg": segno.make(uri, error="m").svg_inline(scale=5, dark="#000", light="#fff")}
+
+
+@router.post("/poc/activate")
+def poc_activate(body: S.PocActivateIn, db: Session = Depends(get_db)):
+    """Called by the phone app: trade a one-time activation code for a device token."""
+    from .services.poc import new_token, token_hash
+    sub = db.get(Subscriber, body.unit)
+    code = body.code.strip().upper().replace("-", "").replace(" ", "")
+    if (not sub or not sub.poc_activation_hash or not sub.poc_activation_expires
+            or sub.poc_activation_expires < now() or not verify_secret(code, sub.poc_activation_hash)):
+        time.sleep(1)
+        raise HTTPException(403, "invalid or expired activation code")
+    if not sub.enabled:
+        raise HTTPException(403, "this radio is inhibited")
+    token = new_token()
+    sub.poc_activation_hash, sub.poc_activation_expires = "", None
+    db.add(PocDevice(subscriber_id=sub.id, token_hash=token_hash(token), name=body.device_name[:64],
+                     platform=body.platform[:16], app_version=body.app_version[:16]))
+    db.commit()
+    bus.publish("poc", action="activated", unit=sub.id, alias=sub.alias, platform=body.platform)
+    return {"token": token, "unit": sub.id, "alias": sub.alias, "ws_path": "/poc/ws"}
+
+
+@router.get("/poc/devices", dependencies=admin)
+def poc_devices(db: Session = Depends(get_db)):
+    online = {s["device_id"] for s in (state.poc.status()["sessions"] if state.poc else [])}
+    return [{**d.to_dict(), "online": d.id in online} for d in db.query(PocDevice).order_by(PocDevice.subscriber_id)]
+
+
+@router.post("/poc/devices/{pk}/revoke", dependencies=admin)
+async def poc_revoke(pk: int, db: Session = Depends(get_db)):
+    d = _get_or_404(db, PocDevice, pk)
+    d.revoked = True
+    db.commit()
+    if state.poc:
+        await state.poc.refresh()
+    return {"ok": True}
+
+
+@router.get("/poc/status", dependencies=admin)
+def poc_status():
+    return state.poc.status() if state.poc else {"sessions": [], "emergencies": {}, "disabled": True}
+
+
 # ============================================================== calls & dashboard
 @router.get("/calls", dependencies=admin)
 def list_calls(limit: int = Query(100, le=1000), tg: int | None = None, site: int | None = None,
@@ -442,6 +554,7 @@ def dashboard(db: Session = Depends(get_db)):
     for s in db.query(Site).order_by(Site.id).all():
         sess = state.ctl.sessions.get(s.id)
         sites.append({**s.to_dict(), "channels": len(s.channels),
+                      "peers_up": sum(1 for p in (state.fne.peers.values() if state.fne else []) if p.get("site_id") == s.id),
                       "mode_mix": sorted({c.mode for c in s.channels}),
                       "codec": sess.codec.name if sess else None,
                       "edge_mode": sess.mode if sess else None})
@@ -461,6 +574,8 @@ def dashboard(db: Session = Depends(get_db)):
         "hourly": hourly,
         "sites": sites,
         "call_processing": state.ctl.status(),
+        "dvm": state.fne.status() if state.fne else None,
+        "poc": state.poc.status() if state.poc else None,
         "transcoder": state.transcoder.status(),
         "sip": state.sip.status() if state.sip else {"enabled": False},
         "wireguard": {"enabled": state.wg.enabled, "interface": state.wg.interface,

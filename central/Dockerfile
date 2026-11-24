@@ -11,6 +11,8 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 COPY lmrcommon /opt/lmr/lmrcommon
 COPY edge /opt/lmr/edge
+COPY dvm/dvmhost /opt/lmr/dvm/dvmhost
+COPY dvm/FORK.md /opt/lmr/dvm/FORK.md
 COPY central/app /opt/lmr/central/app
 
 ENV PYTHONPATH=/opt/lmr:/opt/lmr/central \

@@ -12,8 +12,8 @@ services:
       - /dev/gpiochip0
       - /dev/gpiochip4      # Pi 5 header GPIO (remove on Pi 4)
       - /dev/snd
-      # - /dev/ttyUSB0      # DVSI vocoder
-      # - /dev/ttyUSB1      # radio data port (site-trunking messages)
+      - /dev/ttyACM0        # DVM-V1 modem / DVM hotspot / DVM-V24 (adjust to your devices)
+      # - /dev/ttyUSB0      # second modem, or serial RTS-PTT / CTS-COR for an analog radio
     volumes:
       - /etc/lmr-edge:/etc/lmr-edge
       - /var/lib/lmr-edge:/var/lib/lmr-edge

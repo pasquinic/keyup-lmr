@@ -75,14 +75,15 @@ def main():
     tmp = tempfile.mkdtemp(prefix="keyup-rules-")
     env = {**os.environ, "PYTHONPATH": f"{ROOT}:{ROOT}/central", "LMR_DATA_DIR": tmp,
            "DATABASE_URL": f"sqlite:///{tmp}/k.db", "WG_ENABLED": "false", "ALLOW_UNTUNNELED_EDGES": "true",
-           "HTTP_PORT": str(PORT), "VOICE_PORT": "15200", "HTTP_HOST": "127.0.0.1", "LOG_LEVEL": "WARNING"}
+           "HTTP_PORT": str(PORT), "VOICE_PORT": "15200", "HTTP_HOST": "127.0.0.1", "LOG_LEVEL": "WARNING",
+           "KEYUP_DEFAULT_BACKEND": "native"}
     procs = [subprocess.Popen([sys.executable, "-m", "app.main"], cwd=f"{ROOT}/central", env=env,
                               stdout=open(f"{tmp}/central.log", "w"), stderr=subprocess.STDOUT)]
     try:
         wait(lambda: req("GET", "/healthz", auth=False)["ok"], msg="central")
         TOKEN = req("POST", "/api/auth/login", {"username": "admin", "password": "admin"}, auth=False)["token"]
         req("PUT", "/api/settings", {"cw_id_interval_s": "5", "parrot_delay_ms": "500"})
-        req("POST", "/api/bandplan", {"id": 2, "name": "UHF", "base_mhz": 450.0, "spacing_khz": 6.25, "offset_mhz": 5.0})
+        req("POST", "/api/idens", {"id": 2, "name": "UHF", "base_mhz": 450.0, "spacing_khz": 6.25, "offset_mhz": 5.0})
         for sid, name in ((1, "North"), (2, "South")):
             req("POST", "/api/sites", {"id": sid, "name": name})
         tgs = [(100, "Fire", {}), (200, "PW", {}), (300, "Ops", {"site_ids": "1"}), (400, "Parrot", {"parrot": True}),

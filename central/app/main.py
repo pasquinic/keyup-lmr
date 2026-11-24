@@ -43,6 +43,8 @@ def seed() -> None:
             log.warning("created admin user '%s' -- change the password", settings.admin_user)
         for k, v in DEFAULT_SYSTEM_SETTINGS.items():
             if not db.get(SystemSetting, k):
+                if k == "call_backend" and os.getenv("KEYUP_DEFAULT_BACKEND"):
+                    v = os.getenv("KEYUP_DEFAULT_BACKEND")
                 db.add(SystemSetting(key=k, value=v))
         for s in db.query(Site).all():
             s.status = "offline"
@@ -70,12 +72,33 @@ async def lifespan(app: FastAPI):
     transport, _ = await loop.create_datagram_endpoint(lambda: VoiceProtocol(state.ctl),
                                                        local_addr=(settings.voice_bind, settings.voice_port))
     tasks = [asyncio.create_task(state.ctl.watchdog())]
+    with session_scope() as db:
+        from .services.call_controller import get_system_settings
+        backend = get_system_settings(db).get("call_backend", "dvm")
+    if backend == "dvm":
+        from .services import dvm
+        state.fne = dvm.FneMonitor(state.ctl)
+        state.ctl.fne = state.fne
+        try:
+            res = await dvm.apply(state.fne)
+            if not res["license_acknowledged"]:
+                log.warning("DVM license not acknowledged yet: FNE not started (System Settings)")
+        except Exception:
+            log.exception("DVM config generation failed")
+        tasks.append(asyncio.create_task(state.fne.run()))
+        from .services.poc import PocGateway
+        from .services.tg_audio import TgAudioHub
+        state.ctl.hub = TgAudioHub(state.fne)
+        state.ctl.hub.refresh()
+        state.ctl.poc = state.poc = PocGateway(state.ctl)
+        state.fne.poc = state.poc
+        tasks.append(asyncio.create_task(state.poc.run()))
     if settings.ari_enabled:
         from .services.sip_gateway import SipGateway
         state.sip = SipGateway(state.ctl)
         state.ctl.sip_gateway = state.sip
         tasks.append(asyncio.create_task(state.sip.run()))
-    log.info("central up: http :%d, voice udp :%d, wg %s (%s), %d DVSI vocoders",
+    log.info("central up: backend %s, http :%d, voice udp :%d, wg %s (%s), %d DVSI vocoders", backend,
              settings.http_port, settings.voice_port, state.wg.server_ip,
              "kernel" if state.wg.enabled else "mock", pool.hardware_count)
     yield
@@ -121,6 +144,25 @@ def edge_agent():
     return Response(_agent_tgz, media_type="application/gzip")
 
 
+_dvm_tgz: bytes | None = None
+
+
+@app.get("/edge/dvm-src.tar.gz", include_in_schema=False)
+def edge_dvm_source():
+    """Source of the KeyUp DVM fork (GPL-2.0) for edges to build dvmhost / dvmbridge."""
+    global _dvm_tgz
+    if _dvm_tgz is None:
+        root = os.path.join(EDGE_SRC, "dvm", "dvmhost")
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            tar.add(root, arcname="dvmhost", filter=lambda ti: None if ti.name == "dvmhost/build" or ti.name.startswith("dvmhost/build/") else ti)
+            fork = os.path.join(EDGE_SRC, "dvm", "FORK.md")
+            if os.path.exists(fork):
+                tar.add(fork, arcname="FORK.md")
+        _dvm_tgz = buf.getvalue()
+    return Response(_dvm_tgz, media_type="application/gzip")
+
+
 # ------------------------------------------------------------ edge control channel
 @app.websocket("/edge/ws")
 async def edge_ws(ws: WebSocket):
@@ -160,6 +202,17 @@ async def edge_ws(ws: WebSocket):
         log.exception("edge ws error")
     finally:
         await state.ctl.unregister_edge(sess)
+
+
+# ------------------------------------------------------------ PoC (cellular subscriber radios)
+@app.websocket("/poc/ws")
+async def poc_ws(ws: WebSocket):
+    if state.poc is None:
+        await ws.accept()
+        await ws.send_text(json.dumps({"t": "auth_fail", "reason": "poc_requires_dvm_backend"}))
+        await ws.close(code=4003)
+        return
+    await state.poc.handle(ws)
 
 
 # ------------------------------------------------------------ dashboard live feed

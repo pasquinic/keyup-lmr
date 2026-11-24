@@ -1,0 +1,7 @@
+**/__pycache__
+**/node_modules
+dvm/dvmhost/build
+mobile/android
+mobile/ios
+data
+.git

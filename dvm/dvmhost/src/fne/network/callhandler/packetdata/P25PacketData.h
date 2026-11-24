@@ -1,0 +1,336 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Digital Voice Modem - Converged FNE Software
+ * GPLv2 Open Source. Use is subject to license terms.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ * 
+ *  Copyright (C) 2024-2026 Bryan Biedenkapp, N2PLL
+ *
+ */
+/**
+ * @file P25PacketData.h
+ * @ingroup fne_callhandler
+ * @file P25PacketData.cpp
+ * @ingroup fne_callhandler
+ */
+#if !defined(__PACKETDATA__P25_PACKET_DATA_H__)
+#define __PACKETDATA__P25_PACKET_DATA_H__
+
+#include "fne/Defines.h"
+#include "common/Clock.h"
+#include "common/concurrent/deque.h"
+#include "common/concurrent/unordered_map.h"
+#include "common/p25/P25Defines.h"
+#include "common/p25/data/Assembler.h"
+#include "common/p25/data/DataHeader.h"
+#include "common/p25/data/DataBlock.h"
+#include "network/TrafficNetwork.h"
+#include "network/PeerNetwork.h"
+#include "network/callhandler/TagP25Data.h"
+
+#include <deque>
+
+namespace network
+{
+    namespace callhandler
+    {
+        namespace packetdata
+        {
+            // ---------------------------------------------------------------------------
+            //  Class Declaration
+            // ---------------------------------------------------------------------------
+
+            /**
+             * @brief Implements the P25 packet data handler.
+             * @ingroup fne_callhandler
+             */
+            class HOST_SW_API P25PacketData {
+            public:
+                /**
+                 * @brief Initializes a new instance of the P25PacketData class.
+                 * @param network Instance of the TrafficNetwork class.
+                 * @param tag Instance of the TagP25Data class.
+                 * @param debug Flag indicating whether network debug is enabled.
+                 */
+                P25PacketData(TrafficNetwork* network, TagP25Data* tag, bool debug);
+                /**
+                 * @brief Finalizes a instance of the P25PacketData class.
+                 */
+                ~P25PacketData();
+
+                /**
+                 * @brief Process a data frame from the network.
+                 * @param data Network data buffer.
+                 * @param len Length of data.
+                 * @param peerId Peer ID.
+                 * @param pktSeq RTP packet sequence.
+                 * @param streamId Stream ID.
+                 * @param fromUpstream Flag indicating traffic is from a upstream master.
+                 * @returns bool True, if frame is processed, otherwise false.
+                 */
+                bool processFrame(const uint8_t* data, uint32_t len, uint32_t peerId, uint16_t pktSeq, uint32_t streamId, bool fromUpstream = false);
+
+                /**
+                 * @brief Process a data frame from the virtual IP network.
+                 * @param data Network data buffer.
+                 * @param len Length of data.
+                 * @param alreaedyQueued Flag indicating the data frame being processed is already queued.
+                 */
+                void processPacketFrame(const uint8_t* data, uint32_t len, bool alreadyQueued = false);
+
+                /**
+                 * @brief Helper to write a PDU acknowledge response.
+                 * @param ackClass Acknowledgement Class.
+                 * @param ackType Acknowledgement Type.
+                 * @param ackStatus 
+                 * @param llId Logical Link ID.
+                 * @param extendedAddress Flag indicating whether or not to extended addressing is in use.
+                 * @param srcLlId Source Logical Link ID.
+                 */
+                void write_PDU_Ack_Response(uint8_t ackClass, uint8_t ackType, uint8_t ackStatus, uint32_t llId, bool extendedAddress,
+                    uint32_t srcLlId = 0U);
+
+                /**
+                 * @brief Helper used to return a KMM to the calling SU.
+                 * @param data Network data buffer.
+                 * @param len Length of data.
+                 * @param llId Logical Link ID.
+                 * @param encrypted Flag indicating whether or not the KMM frame is encrypted.
+                 */
+                void write_PDU_KMM(const uint8_t* data, uint32_t len, uint32_t llId, bool encrypted);
+
+                /**
+                 * @brief Updates the timer by the passed number of milliseconds.
+                 * @param ms Number of milliseconds.
+                 */
+                void clock(uint32_t ms);
+
+                /**
+                 * @brief Helper to cleanup any call's left in a dangling state without any further updates.
+                 */
+                void cleanupStale();
+
+            private:
+                TrafficNetwork* m_network;
+                TagP25Data* m_tag;
+
+                p25::data::Assembler* m_assembler;
+
+                /**
+                 * @brief Represents the data required for a PDU assembler custom writer context.
+                 * @ingroup fne_network
+                 */
+                struct UserContext {
+                    void* obj;                      //!< Instance of the P25PacketData class.
+                    uint32_t peerId;                //!< Peer ID for this request.
+                    uint32_t srcPeerId;             //!< Source Peer ID for this request.
+                    network::PeerNetwork* peerNet;  //!< Instance of the peer network for an upstream peer.
+                    p25::data::DataHeader* header;  //!< PDU data header.
+                    uint16_t pktSeq;                //!< Packet sequence.
+                    uint32_t streamId;              //!< Stream ID.
+                };
+
+                /**
+                 * @brief Represents a queued data frame from the VTUN.
+                 */
+                class QueuedDataFrame {
+                public:
+                    p25::data::DataHeader* header;  //!< Instance of a PDU data header.
+                    uint32_t llId;                  //!< Logical Link ID
+                    uint32_t tgtProtoAddr;          //!< Target Protocol Address
+
+                    uint8_t* userData;              //!< Raw data buffer
+                    uint32_t userDataLen;           //!< Length of raw data buffer
+
+                    uint64_t timestamp;             //!< Timestamp in milliseconds
+                    uint8_t retryCnt;               //!< Packet Retry Counter
+                    bool extendRetry;               //!< Flag indicating whether or not to extend the retry count for this packet.
+                };
+                concurrent::deque<QueuedDataFrame*> m_queuedFrames;
+
+                /**
+                 * @brief Represents the receive status of a call.
+                 */
+                class RxStatus {
+                public:
+                    system_clock::hrc::hrc_t callStartTime;     //!< Data call start time
+                    system_clock::hrc::hrc_t lastPacket;        //!< Last packet time
+                    uint32_t llId;                              //!< Logical Link ID
+                    uint32_t streamId;                          //!< Stream ID
+                    uint32_t peerId;                            //!< Peer ID
+
+                    std::unordered_map<uint16_t, uint8_t*> receivedBlocks;
+                    p25::data::Assembler assembler;             //!< PDU Assembler Instance
+                    bool hasRxHeader;                           //!< Flag indicating whether or not a valid Rx header has been received
+                    uint16_t dataBlockCnt;                      //!< Number of data blocks received
+                    uint16_t totalBlocks;                       //!< Total number of blocks expected
+
+                    bool callBusy;                              //!< Flag indicating whether or not the call is busy
+
+                    uint8_t* pduUserData;                       //!< PDU user data buffer
+                    uint32_t pduUserDataLength;                 //!< Length of PDU user data buffer
+
+                    /**
+                     * @brief Initializes a new instance of the RxStatus class
+                     */
+                    RxStatus() :
+                        llId(0U),
+                        streamId(0U),
+                        peerId(0U),
+                        receivedBlocks(),
+                        assembler(),
+                        hasRxHeader(false),
+                        dataBlockCnt(0U),
+                        totalBlocks(0U),
+                        callBusy(false),
+                        pduUserData(nullptr),
+                        pduUserDataLength(0U)
+                    {
+                        pduUserData = new uint8_t[P25DEF::P25_MAX_PDU_BLOCKS * P25DEF::P25_PDU_CONFIRMED_LENGTH_BYTES + 2U];
+                        ::memset(pduUserData, 0x00U, P25DEF::P25_MAX_PDU_BLOCKS * P25DEF::P25_PDU_CONFIRMED_LENGTH_BYTES + 2U);
+                    }
+                    /**
+                     * @brief Finalizes a instance of the RxStatus class
+                     */
+                    ~RxStatus()
+                    {
+                        clearReceivedBlocks();
+                        if (pduUserData != nullptr)
+                            delete[] pduUserData;
+                    }
+
+                    /**
+                     * @brief Clears all received blocks and frees associated memory.
+                     */
+                    void clearReceivedBlocks()
+                    {
+                        totalBlocks = 0U;
+                        dataBlockCnt = 0U;
+
+                        if (!receivedBlocks.empty()) {
+                            for (auto& it : receivedBlocks) {
+                                if (it.second != nullptr) {
+                                    delete[] it.second;
+                                    it.second = nullptr;
+                                }
+                            }
+                            receivedBlocks.clear();
+                        }
+                    }
+                };
+                typedef std::pair<const uint32_t, RxStatus*> StatusMapPair;
+                concurrent::unordered_map<uint32_t, RxStatus*> m_status;
+
+                typedef std::pair<const uint32_t, uint32_t> ArpTablePair;
+                std::unordered_map<uint32_t, uint32_t> m_arpTable;
+                typedef std::pair<const uint32_t, bool> ReadyForNextPktPair;
+                std::unordered_map<uint32_t, bool> m_readyForNextPkt;
+                std::unordered_map<uint32_t, uint8_t> m_suSendSeq;      // V(S) send state variable per LLId
+                std::unordered_map<uint32_t, uint8_t> m_suRecvSeq;      // V(R) receive state variable per LLId
+
+                bool m_debug;
+
+                /**
+                 * @brief Helper to dispatch PDU user data.
+                 * @param peerId Peer ID.
+                 */
+                void dispatch(uint32_t peerId);
+                /**
+                 * @brief Helper to dispatch PDU user data back to the FNE network.
+                 * @param peerId Peer ID.
+                 */
+                void dispatchToFNE(uint32_t peerId);
+                /**
+                 * @brief Helper to dispatch PDU user data back to the local FNE network. (Will not transmit to neighbor FNE peers.)
+                 * @param dataHeader Instance of a PDU data header.
+                 * @param extendedAddress Flag indicating whether or not to extended addressing is in use.
+                 * @param auxiliaryES Flag indicating whether or not an auxiliary ES is included.
+                 * @param pduUserData Buffer containing user data to transmit.
+                 */
+                void dispatchUserFrameToFNE(p25::data::DataHeader& dataHeader, bool extendedAddress, bool auxiliaryES, uint8_t* pduUserData);
+
+                /**
+                 * @brief Helper used to process conventional data registration from PDU data.
+                 * @param status Instance of the RxStatus class.
+                 * @returns bool True, if conventional data registration data was processed, otherwise false.
+                 */
+                bool processConvDataReg(RxStatus* status);
+                /**
+                 * @brief Helper used to process SNDCP control data from PDU data.
+                 * @param status Instance of the RxStatus class.
+                 * @returns bool True, if SNDCP control data was processed, otherwise false.
+                 */
+                bool processSNDCPControl(RxStatus* status);
+
+                /**
+                 * @brief Helper write ARP request to the network.
+                 * @param addr IP Address.
+                 */
+                void write_PDU_ARP(uint32_t addr);
+                /**
+                 * @brief Helper write ARP reply to the network.
+                 * @param targetAddr Target IP Address.
+                 * @param requestorLlid Requestor Logical Link Address.
+                 * @param requestorAddr Requestor IP Address.
+                 * @param targetLlId Target Logical Link Address.
+                 */
+                void write_PDU_ARP_Reply(uint32_t targetAddr, uint32_t requestorLlid, uint32_t requestorAddr, uint32_t targetLlid = 0U);
+
+                /**
+                 * @brief Helper to write user data as a P25 PDU packet.
+                 * @param peerId Peer ID.
+                 * @param srcPeerId Source Peer ID.
+                 * @param peerNet Instance of PeerNetwork to use to send traffic.
+                 * @param dataHeader Instance of a PDU data header.
+                 * @param extendedAddress Flag indicating whether or not to extended addressing is in use.
+                 * @param auxiliaryES Flag indicating whether or not an auxiliary ES is included.
+                 * @param pduUserData Buffer containing user data to transmit.
+                 */
+                void write_PDU_User(uint32_t peerId, uint32_t srcPeerId, network::PeerNetwork* peerNet, p25::data::DataHeader& dataHeader,
+                    bool extendedAddress, bool auxiliaryES, uint8_t* pduUserData);
+
+                /**
+                 * @brief Write data processed to the network.
+                 * @param peerId Peer ID.
+                 * @param srcPeerId Source Peer ID.
+                 * @param peerNet Instance of PeerNetwork to use to send traffic.
+                 * @param dataHeader Instance of a PDU data header.
+                 * @param currentBlock Current Block ID.
+                 * @param data Buffer containing block data.
+                 * @param len Length of buffer.
+                 * @param pktSeq RTP packet sequence.
+                 * @param streamId Stream ID.
+                 */
+                bool writeNetwork(uint32_t peerId, uint32_t srcPeerId, network::PeerNetwork* peerNet, const p25::data::DataHeader& dataHeader, const uint8_t currentBlock, 
+                    const uint8_t* data, uint32_t len, uint16_t pktSeq, uint32_t streamId);
+
+                /**
+                 * @brief Helper to determine if the logical link ID has an ARP entry.
+                 * @param llId Logical Link Address.
+                 * @returns bool True, if the logical link ID has an arp entry, otherwise false.
+                 */
+                bool hasARPEntry(uint32_t llId) const;
+                /**
+                 * @brief Helper to get the IP address for the given logical link ID.
+                 * @param llId Logical Link Address.
+                 * @returns uint32_t Numerical IP address.
+                 */
+                uint32_t getIPAddress(uint32_t llId);
+                /**
+                 * @brief Helper to get the logical link ID granted to the given IP address.
+                 * @param addr Numerical IP address.
+                 * @returns uint32_t Logical Link Address.
+                 */
+                uint32_t getLLIdAddress(uint32_t addr);
+                /**
+                 * @brief Helper to allocate a dynamic IP address for SNDCP.
+                 * @param llId Logical Link Address.
+                 * @returns uint32_t Allocated IP address.
+                 */
+                uint32_t allocateIPAddress(uint32_t llId);
+            };
+        } // namespace packetdata
+    } // namespace callhandler
+} // namespace network
+
+#endif // __PACKETDATA__P25_PACKET_DATA_H__

@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  server:
+    name: Server tests (native backend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r central/requirements.txt -r edge/requirements.txt pytest pyyaml
+      - run: PYTHONPATH=.:central pytest -q tests
+      - run: python3 tests/lab_e2e.py
+      - run: python3 tests/lab_rules_e2e.py
+
+  dvm:
+    name: DVM fork build + lab (FNE, dvmhost, bridges, PoC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sudo apt-get update && sudo apt-get install -y cmake g++ make libasio-dev libncurses-dev libssl-dev
+      - name: Build the KeyUp DVM fork
+        run: |
+          mkdir -p dvm/dvmhost/build && cd dvm/dvmhost/build
+          cmake .. -DENABLE_TUI_SUPPORT=off -DCMAKE_BUILD_TYPE=Release
+          make -j"$(nproc)" dvmfne dvmhost dvmbridge dvmcmd
+      - run: pip install -r central/requirements.txt -r edge/requirements.txt pytest pyyaml
+      - run: cd mobile && npm ci --legacy-peer-deps
+      - run: DVM_BIN_DIR=$PWD/dvm/dvmhost/build python3 tests/lab_dvm_e2e.py
+
+  mobile:
+    name: Mobile app checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - run: npm ci --legacy-peer-deps
+      - run: npm run typecheck
+      - run: npx eslint src
+      - run: npm test
