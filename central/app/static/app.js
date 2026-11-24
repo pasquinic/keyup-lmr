@@ -194,7 +194,7 @@ function drawLive() {
   box.innerHTML = calls.length ? calls.map(c => `<div class="callrow ${c.emergency ? "emerg" : ""} ${c.state === "hang" ? "hang" : ""}">
     <span class="tx" style="${c.state === "hang" ? "animation:none;background:var(--warn)" : ""}"></span>
     <div><div class="tg">TG ${esc(c.tg)} · ${esc(c.tg_name)} ${c.emergency ? pill("EMERGENCY", "emerg") : ""} ${c.state === "hang" ? pill("hang") : ""}</div>
-    <div class="muted">${esc(c.src_alias)} @ ${esc(c.src_label)} → ${c.dests.map(esc).join(", ") || "no destinations"} · ${esc(c.codec)}${c.via_sip ? " · SIP" : ""}</div></div>
+    <div class="muted">${esc(c.src_alias)} @ ${esc(c.src_label)} → ${c.dests.map(esc).join(", ") || "no destinations"} · ${esc(c.codec)}${c.via_sip ? " · SIP" : ""}${c.linked && c.linked.length ? " · patched to TG " + c.linked.map(esc).join(", ") : ""}${c.parrot ? " · parrot" : ""}</div></div>
     <div class="t">${dur(Date.now() / 1000 - c.started)}</div></div>`).join("") : `<div class="empty">No active calls</div>`;
 }
 function drawLog() {
@@ -229,18 +229,25 @@ pages.sites = resourcePage({
   fields: [{name: "id", label: "Site number", type: "number", required: true, readonly: true}, {name: "name", label: "Name", required: true},
     {name: "location", label: "Location"}, {name: "rfss_id", label: "RFSS ID", type: "number", default: 1},
     {name: "network_codec", label: "Network codec", type: "select", options: ["AUTO", "ULAW", "PCM16", "IMBE", "AMBE2"], default: "AUTO"},
+    {name: "callsign", label: "Station callsign (CW ID, blank = off)"}, {name: "latitude", label: "Latitude", type: "number"}, {name: "longitude", label: "Longitude", type: "number"},
     {name: "enabled", label: "Enabled", type: "bool", default: true}, {name: "notes", label: "Notes", type: "textarea", wide: true}],
 });
 
 pages.talkgroups = resourcePage({
   path: "talkgroups", title: "Talkgroup",
   columns: [{key: "id", label: "TGID"}, {key: "name", label: "Name"}, {key: "priority", label: "Priority"}, {key: "hang_time_ms", label: "Hang ms"},
-    {label: "Emergency", render: r => yes(r.emergency_enabled)}, {label: "SIP", render: r => r.allow_sip ? `${pill("yes")} <span class="mono">${esc(r.sip_extension || r.id)}</span>` : yes(false)}, {label: "Enabled", render: r => yes(r.enabled)}],
+    {label: "Emergency", render: r => yes(r.emergency_enabled)}, {label: "SIP", render: r => r.allow_sip ? `${pill("yes")} <span class="mono">${esc(r.sip_extension || r.id)}</span>` : yes(false)},
+    {label: "Rules", render: r => [r.restricted && "restricted", r.affiliated_only && "affiliated only", r.parrot && "parrot", r.site_ids && "sites " + r.site_ids].filter(Boolean).map(esc).join(" · ") || '<span class="muted">open</span>'},
+    {label: "Enabled", render: r => yes(r.enabled)}],
   fields: [{name: "id", label: "TGID", type: "number", required: true, readonly: true}, {name: "name", label: "Name", required: true},
     {name: "description", label: "Description", wide: true}, {name: "priority", label: "Priority (1-10)", type: "number", default: 5},
     {name: "hang_time_ms", label: "Hang time (ms)", type: "number", default: 3000}, {name: "emergency_enabled", label: "Emergency calls allowed", type: "bool", default: true},
     {name: "allow_sip", label: "Allow SIP interconnect", type: "bool"}, {name: "sip_extension", label: "SIP dial extension", placeholder: "e.g. 7101"},
-    {name: "enabled", label: "Enabled", type: "bool", default: true}],
+    {name: "enabled", label: "Enabled", type: "bool", default: true},
+    {name: "restricted", label: "Restricted: only radios that list this TG may talk", type: "bool", group: "Routing rules"},
+    {name: "affiliated_only", label: "Repeat only at sites where a radio on this TG was heard", type: "bool", group: "Routing rules"},
+    {name: "parrot", label: "Parrot: echo each transmission back to the talker", type: "bool", group: "Routing rules"},
+    {name: "site_ids", label: "Allowed sites (comma list, blank = all)", placeholder: "1,2", group: "Routing rules"}],
 });
 
 const CHANNEL_FIELDS = [
@@ -257,12 +264,17 @@ const CHANNEL_FIELDS = [
   {name: "tx_delay_ms", label: "TX delay ms", type: "number", default: 150, group: "Edge hardware"}, {name: "tx_tail_ms", label: "TX tail ms", type: "number", default: 200, group: "Edge hardware"},
   {name: "rx_gain_db", label: "RX gain dB", type: "number", group: "Edge hardware"}, {name: "tx_gain_db", label: "TX gain dB", type: "number", group: "Edge hardware"},
   {name: "enabled", label: "Enabled", type: "bool", default: true, group: "Edge hardware"},
+  {name: "signaling", label: "PTT / COR via", type: "select", options: [{value: "gpio", label: "GPIO pins"}, {value: "serial", label: "Serial port RTS (PTT) / CTS (COR)"}], default: "gpio", group: "Edge hardware"},
+  {name: "serial_port", label: "Serial port (serial signalling)", placeholder: "/dev/ttyUSB0", group: "Edge hardware"},
+  {name: "cor_invert", label: "Invert CTS (serial)", type: "bool", group: "Edge hardware"},
 ];
 pages.channels = resourcePage({
   path: "channels", listPath: "frequencies", title: "Channel",
   columns: [{label: "Site", render: r => `${esc(r.site_id)} · ${esc(r.site_name)}`}, {key: "slot", label: "Port"}, {key: "name", label: "Name"}, {label: "Mode", render: r => pill(r.mode, "mode")},
     {label: "RX / TX MHz", render: r => `<span class="mono">${mhz(r.rx_mhz)} / ${mhz(r.tx_mhz)}</span>`}, {label: "Access", render: r => esc(r.mode.startsWith("P25") ? "NAC " + r.nac : r.mode === "DMR" ? `CC${r.color_code} TS${r.timeslot}` : r.mode === "NXDN" ? "RAN " + r.ran : r.ctcss_hz ? r.ctcss_hz + " Hz" : "CSQ")},
-    {key: "talkgroup_id", label: "TG"}, {key: "codec", label: "Codec"}, {label: "GPIO", render: r => `<span class="mono">PTT ${r.ptt_gpio} / COR ${r.cor_gpio}</span>`},
+    {key: "talkgroup_id", label: "TG"}, {key: "codec", label: "Codec"},
+    {label: "Band plan", render: r => r.identity !== null && r.identity !== undefined ? `<span class="mono">id ${r.identity} · ch ${r.channel_no}</span>` : '<span class="muted">—</span>'},
+    {label: "PTT / COR", render: r => `<span class="mono">${r.signaling === "serial" ? `RTS/CTS ${esc(r.serial_port)}` : `GPIO ${r.ptt_gpio} / ${r.cor_gpio}`}</span>`},
     {label: "Checks", render: r => r.warnings.length ? `<div class="warnlist">${r.warnings.map(esc).join("<br>")}</div>` : pill("ok", "yes")}],
   fields: CHANNEL_FIELDS,
 });
@@ -349,6 +361,52 @@ pages.sip = async el => {
   };
 };
 
+
+pages.bandplan = resourcePage({
+  path: "bandplan", title: "Band Plan Entry",
+  columns: [{key: "id", label: "Identity"}, {key: "name", label: "Name"}, {label: "Base MHz", render: r => `<span class="mono">${Number(r.base_mhz).toFixed(5)}</span>`},
+    {label: "Spacing", render: r => `${r.spacing_khz} kHz`}, {label: "Input offset", render: r => `${r.offset_mhz >= 0 ? "+" : ""}${r.offset_mhz} MHz`}, {label: "Bandwidth", render: r => `${r.bandwidth_khz} kHz`}],
+  fields: [{name: "id", label: "Identity (0-15)", type: "number", required: true, readonly: true}, {name: "name", label: "Name", placeholder: "UHF 450"},
+    {name: "base_mhz", label: "Base frequency (MHz)", type: "number", required: true}, {name: "spacing_khz", label: "Channel spacing (kHz)", type: "number", default: 6.25},
+    {name: "offset_mhz", label: "Input offset (MHz, RX = TX + offset)", type: "number", default: 5}, {name: "bandwidth_khz", label: "Bandwidth (kHz)", type: "number", default: 12.5}],
+  newDefaults: {spacing_khz: 6.25, offset_mhz: 5, bandwidth_khz: 12.5},
+});
+
+pages.patches = resourcePage({
+  path: "patches", title: "Patch",
+  columns: [{key: "name", label: "Name"}, {label: "Talkgroup A", render: r => `TG ${esc(r.tg_a)}`}, {label: "", render: () => "⇄"},
+    {label: "Talkgroup B", render: r => `TG ${esc(r.tg_b)}`}, {label: "Enabled", render: r => yes(r.enabled)}],
+  fields: [{name: "name", label: "Name", required: true}, {name: "tg_a", label: "Talkgroup A", type: "select", options: "talkgroups", numeric: true},
+    {name: "tg_b", label: "Talkgroup B", type: "select", options: "talkgroups", numeric: true}, {name: "enabled", label: "Enabled", type: "bool", default: true}],
+});
+
+pages.network = async el => {
+  const [n, sites] = await Promise.all([api("/network"), api("/sites")]);
+  el.innerHTML = `
+  <div class="grid kpis">${kpi(n.sites.length, "Edges connected")}${kpi(n.sites.reduce((a, s) => a + s.channels.length, 0), "Channels up")}
+    ${kpi(n.affiliations.length, "Affiliations")}${kpi(n.checks.length, "Config issues")}</div>
+  ${n.sites.map(s => `<div class="card" style="margin-top:16px"><h3>${pill(s.mode === "site_trunking" ? "site_trunking" : "online")} Site ${esc(s.site_id)} · ${esc(s.label)}</h3>
+    <dl class="kv"><dt>Edge</dt><dd>${esc(s.remote_ip)} · heartbeat ${s.heartbeat_age_s}s ago · v${esc(s.telemetry.version || "?")}${s.telemetry.cpu_temp_c ? ` · ${s.telemetry.cpu_temp_c}°C` : ""}</dd>
+    <dt>Voice path</dt><dd>${s.voice_bound ? "bound" : "not bound"} · network codec ${esc(s.codec)} · vocoders ${esc(s.vocoders.join("/"))}</dd></dl>
+    <table style="margin-top:8px"><thead><tr><th>Port</th><th>Channel</th><th>Mode</th><th>TG</th><th>Carrier (COR)</th><th>Transmit (PTT)</th></tr></thead><tbody>
+    ${s.channels.map(c => `<tr><td>${esc(c.slot ?? "")}</td><td>${esc(c.name)}</td><td>${pill(c.mode || "", "mode")}</td><td>${esc(c.tg ?? "—")}</td>
+      <td>${c.cor ? pill("receiving", "online") : '<span class="muted">idle</span>'}</td><td>${c.ptt ? pill("keyed", "denied") : '<span class="muted">idle</span>'}</td></tr>`).join("") || `<tr><td colspan="6" class="empty">No channels reported</td></tr>`}
+    </tbody></table></div>`).join("") || `<div class="card empty" style="margin-top:16px">No edge devices connected</div>`}
+  <div class="grid two" style="margin-top:16px">
+    <div class="card"><h3>Affiliations</h3><div class="tablewrap"><table><thead><tr><th>Radio</th><th>Site</th><th>TG</th><th>Heard</th></tr></thead><tbody>
+      ${n.affiliations.map(a => `<tr><td>${esc(a.unit)} <span class="muted">${esc(a.alias)}</span></td><td>${esc(a.site)}</td><td>${esc(a.tg)}</td><td>${dur(a.age_s)} ago</td></tr>`).join("") || `<tr><td colspan="4" class="empty">No radios heard yet</td></tr>`}
+    </tbody></table></div></div>
+    <div class="card"><h3>Configuration checks</h3>${n.checks.length ? `<div class="warnlist">${n.checks.map(c => `<b>${esc(c.scope)}</b>: ${esc(c.message)}`).join("<br>")}</div>` : pill("ok", "yes") + ' <span class="muted">no problems found</span>'}</div>
+  </div>
+  <div class="card" style="margin-top:16px"><h3>Configuration pushed to an edge</h3>
+    <div class="toolbar"><select id="pvSite">${sites.map(s => `<option value="${s.id}">Site ${s.id} · ${esc(s.name)}</option>`).join("")}</select><button class="btn" id="pvGo" ${sites.length ? "" : "disabled"}>Show</button></div>
+    <div id="pvOut" class="muted">Read-only view of what the site's edge receives.</div></div>`;
+  $("#pvGo", el).onclick = async () => {
+    const cfg = await api(`/network/preview?site_id=${$("#pvSite").value}`);
+    $("#pvOut").innerHTML = `<div class="code" style="max-height:420px;overflow:auto">${esc(JSON.stringify(cfg, null, 2))}</div>`;
+  };
+};
+
 pages.calls = async el => {
   const q = new URLSearchParams(location.hash.split("?")[1] || "");
   const rows = await api(`/calls?limit=300${q.get("tg") ? "&tg=" + q.get("tg") : ""}${q.get("site") ? "&site=" + q.get("site") : ""}`);
@@ -366,7 +424,8 @@ pages.settings = async el => {
   const s = await api("/settings");
   const labels = {system_name: "System name", wacn: "WACN (hex)", system_id: "System ID (hex)", require_known_subscriber: "Require known subscriber (true/false)",
     site_trunking_timeout_s: "Site trunking after link loss (s)", site_trunking_announce_interval_s: "Site trunking re-announce interval (s)",
-    site_trunking_message: "Site trunking data message", wide_area_message: "Wide-area restored message", default_hang_time_ms: "Default hang time (ms)", max_call_s: "Max call duration (s)"};
+    site_trunking_message: "Site trunking data message", wide_area_message: "Wide-area restored message", default_hang_time_ms: "Default hang time (ms)", max_call_s: "Max call duration (s)",
+    affiliation_timeout_s: "Affiliation timeout (s)", cw_id_interval_s: "CW ID interval per transmitter (s)", parrot_delay_ms: "Parrot echo delay (ms)"};
   el.innerHTML = `<div class="grid two"><div class="card"><h3>System</h3><form id="sForm" class="formgrid">${Object.entries(s).map(([k, v]) => `<label>${esc(labels[k] || k)}<input name="${esc(k)}" value="${esc(v)}"></label>`).join("")}
     <div class="wide"><button class="btn primary">Save &amp; push to sites</button></div></form></div>
     <div class="card"><h3>Change password</h3><form id="pForm" class="formgrid"><label class="wide">Current<input type="password" name="old"></label><label class="wide">New (8+ chars)<input type="password" name="new"></label><div><button class="btn">Update</button></div></form></div></div>`;
@@ -375,7 +434,7 @@ pages.settings = async el => {
 };
 
 // ------------------------------------------------------------------ router
-const TITLES = {dashboard: "Dashboard", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
+const TITLES = {network: "Network", bandplan: "Band Plan", patches: "Talkgroup Patches", dashboard: "Dashboard", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
   subscribers: "Subscriber Radios", sip: "SIP Interconnect", calls: "Call History", settings: "System Settings"};
 async function route() {
   const page = (location.hash.slice(2).split("?")[0]) || "dashboard";

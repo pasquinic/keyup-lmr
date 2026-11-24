@@ -69,6 +69,25 @@ A distributed LMR trunking system. Raspberry Pi edge devices connect base statio
   - **On recovery:** subscribers get `WIDE AREA RESTORED`, and the call records logged locally during site trunking are uploaded to central history.
 - **Local troubleshooting API:** `curl localhost:8090/status`.
 
+## System rules and network tools
+
+These match the feature set of the DVMProject-based branch (`dvm-foundation`), implemented in KeyUp's own router, so this branch needs no DVM software.
+
+- **Band plan:** define channel identities (base frequency, spacing, input offset). The frequency plan then shows each channel's identity and channel number, and flags transmit frequencies that are off-plan or have the wrong receive offset.
+- **Talkgroup rules:**
+  - **Restricted:** only radios that list the talkgroup may talk on it.
+  - **Allowed sites:** the talkgroup is refused and not routed anywhere else.
+  - **Affiliated only:** the talkgroup is repeated only at sites where a radio was recently heard on it. Edit the window under System Settings, `affiliation_timeout_s`.
+  - **Parrot:** each transmission is echoed back to the talker's channel, for coverage and audio checks.
+- **Talkgroup patches:** link two talkgroups so a call on either is heard on both. Patches chain (A⇄B, B⇄C), hold the floor on every linked talkgroup, and cross modes, because the router transcodes per site.
+- **Network page:**
+  - every connected edge, with live carrier and transmit state per channel;
+  - the affiliation table;
+  - configuration checks: unbound channels, GPIO clashes, off-plan frequencies, unknown sites in limits, bad patches, sites without an edge;
+  - a read-only view of the config pushed to each edge.
+- **CW ID:** set a callsign on a site and its edge identifies each transmitter in Morse after use, at most once per `cw_id_interval_s` (default 10 minutes).
+- **Serial RTS/CTS radio interfaces:** per channel, choose **PTT / COR via serial port**. The edge then keys PTT with RTS and reads COR on CTS, with an optional invert, as with common USB radio interface cables. Audio still uses the channel's sound card.
+
 ## Deploy the central server (Ubuntu Server 22.04 / 24.04)
 
 ```bash
@@ -108,6 +127,8 @@ If the token is not auto-approve, approve the device on the Edge Devices page. T
 | COR/COS | GPIO input (BCM, default 27), through an opto-isolator | Carrier/squelch detect |
 | PTT | GPIO output (BCM, default 17) → transistor/opto | PTT line |
 
+With a USB radio interface cable you can use **serial signalling** instead: RTS drives PTT and CTS reads COR.
+
 Set `audio_device` to an ALSA `plughw:` device so ALSA resamples to 8 kHz. Pins and sound cards are configured per channel in the web UI.
 
 ## Test without hardware
@@ -116,6 +137,7 @@ Set `audio_device` to an ALSA `plughw:` device so ALSA resamples to 8 kHz. Pins 
 pip install -r central/requirements.txt -r edge/requirements.txt pytest
 PYTHONPATH=.:central pytest -q tests        # protocol, G.711, DVSI framing, transcoder paths
 python3 tests/lab_e2e.py                    # central + 2 simulated sites, full scenario
+python3 tests/lab_rules_e2e.py              # patches, site limits, parrot, affiliated-only, restricted, CW ID
 ```
 
 `lab_e2e.py` runs the full scenario and checks that it passes:
@@ -150,6 +172,9 @@ tests/            unit tests + end-to-end lab test
   - a `send_data()` hook on the radio backend.
 
   Map either one to your radios' text/status messaging, such as the Kenwood, Motorola or Hytera data APIs.
+- **Differences from the DVM branch:**
+  - **No trunked control channels or roaming between neighbor sites.** These come from DVM's modems driving the air interface. Here, each base radio is a conventional repeater bound to one talkgroup.
+  - **Affiliations are inferred** from radios being heard, because there is no control channel for radios to register on. They are kept in memory and reset when the central server restarts.
 - **SIP** was tested against a simulated ARI. It still needs a run against a live Asterisk.
 - **Docker** images and compose were written but not built here, because no Docker daemon was available. The services were tested by running them directly.
 - **Security:** change every default in `.env`, keep port 8080 reachable only from inside the tunnel, and put the UI behind your SSO/VPN if possible. AES/ADP encryption pass-through is flagged in the frame header but not implemented.

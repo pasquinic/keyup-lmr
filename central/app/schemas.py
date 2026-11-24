@@ -20,6 +20,9 @@ class SiteIn(BaseModel):
     network_codec: Literal["AUTO", "ULAW", "PCM16", "IMBE", "AMBE2"] = "AUTO"
     enabled: bool = True
     notes: str = ""
+    callsign: str = ""
+    latitude: float = 0.0
+    longitude: float = 0.0
 
 
 class TalkGroupIn(BaseModel):
@@ -30,6 +33,10 @@ class TalkGroupIn(BaseModel):
     hang_time_ms: int = Field(3000, ge=0, le=30000)
     emergency_enabled: bool = True
     allow_sip: bool = False
+    restricted: bool = False
+    affiliated_only: bool = False
+    parrot: bool = False
+    site_ids: str = Field("", pattern=r"^[0-9, ]*$")
     sip_extension: str = ""
     enabled: bool = True
 
@@ -58,6 +65,9 @@ class ChannelIn(BaseModel):
     rx_gain_db: float = 0.0
     tx_gain_db: float = 0.0
     default_unit_id: int = 0
+    signaling: Literal["gpio", "serial"] = "gpio"
+    serial_port: str = ""
+    cor_invert: bool = False
     enabled: bool = True
 
 
@@ -104,3 +114,19 @@ class OriginateIn(BaseModel):
     talkgroup_id: int
     ptt_mode: Literal["dtmf", "vox"] = "dtmf"
     caller_id: str = "LMR"
+
+
+class BandPlanIn(BaseModel):
+    id: int = Field(ge=0, le=15)
+    name: str = ""
+    base_mhz: float = Field(gt=0)
+    spacing_khz: float = Field(6.25, gt=0)
+    offset_mhz: float = 5.0
+    bandwidth_khz: float = 12.5
+
+
+class PatchIn(BaseModel):
+    name: str
+    tg_a: int
+    tg_b: int
+    enabled: bool = True

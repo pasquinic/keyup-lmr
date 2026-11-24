@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 import websockets
 
-from lmrcommon import audio
+from lmrcommon import audio, morse
 from lmrcommon.modes import Codec
 from lmrcommon.protocol import FrameType, Msg, VoiceFrame, make_keepalive, Flags
 from lmrcommon.vocoder import VocoderPool, VocoderUnavailable
@@ -22,7 +22,7 @@ from .radio import make_channel
 from .state import State
 
 log = logging.getLogger("agent")
-HW_KEYS = ("audio_device", "ptt_gpio", "cor_gpio", "cor_active_low")
+HW_KEYS = ("audio_device", "ptt_gpio", "cor_gpio", "cor_active_low", "signaling", "serial_port", "cor_invert")
 
 
 @dataclass
@@ -61,6 +61,9 @@ class EdgeAgent:
         self.started = time.time()
         self.stats = {"frames_tx": 0, "frames_rx": 0, "calls_tx": 0, "calls_rx": 0, "local_calls": 0}
         self.loop: asyncio.AbstractEventLoop | None = None
+        self.cw_last: dict[int, float] = {}       # channel -> last CW ID time
+        self.cw_pending: dict[int, bool] = {}     # channel transmitted since its last ID
+        self.cw_sent = 0
 
     # ================================================================ helpers
     def channels_cfg(self) -> list[dict]:
@@ -406,9 +409,43 @@ class EdgeAgent:
         await self.send({"type": Msg.SITE_STATUS, "mode": "wide_area"})
         await self.notifier.exit()
 
+    async def _cw_id(self) -> None:
+        """Identify each transmitter in CW (site callsign) after use, at most once per interval."""
+        callsign = (self.cached.get("site") or {}).get("callsign", "").strip()
+        if not callsign:
+            return
+        interval = self.setting("cw_id_interval_s", 600)
+        t = time.time()
+        for cid, r in list(self.radios.items()):
+            if r.ptt and not r.cw_keyed:
+                self.cw_pending[cid] = True
+            if not self.cw_pending.get(cid) or r.ptt or r.cor:
+                continue
+            if t - self.cw_last.get(cid, 0) < interval:
+                continue
+            self.cw_pending[cid], self.cw_last[cid] = False, t
+            r.cw_keyed = True
+            self.cw_sent += 1
+            log.info("CW ID %s on channel %s", callsign, cid)
+
+            async def send(r=r):
+                try:
+                    await r.play(morse.to_pcm(callsign))
+                    for _ in range(100):  # wait out the TX tail so the ID doesn't count as new use
+                        if not r.ptt:
+                            break
+                        await asyncio.sleep(0.05)
+                finally:
+                    r.cw_keyed = False
+            self._task(send())
+
     async def monitor_loop(self) -> None:
         while True:
             await asyncio.sleep(0.5)
+            try:
+                await self._cw_id()
+            except Exception:
+                log.exception("CW ID failed")
             silent = time.time() - self.last_link_ok
             if self.connected and silent > max(self.st_timeout, 6):
                 log.warning("control link silent for %.0fs, dropping connection", silent)
@@ -435,7 +472,8 @@ class EdgeAgent:
 
     def _telemetry(self) -> dict:
         t = {"version": __version__, "mode": self.mode, "uptime_s": round(time.time() - self.started),
-             "vocoders": self.vocoders(), "channels": [r.status() for r in self.radios.values()], **self.stats}
+             "vocoders": self.vocoders(), "channels": [r.status() for r in self.radios.values()],
+             "cw_ids_sent": self.cw_sent, **self.stats}
         try:
             t["cpu_temp_c"] = round(int(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000, 1)
         except Exception:

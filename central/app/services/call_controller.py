@@ -21,7 +21,8 @@ from lmrcommon.protocol import (FrameType, Flags, Msg, VoiceFrame, parse_keepali
 from ..config import settings
 from ..db import session_scope
 from ..models import (CallRecord, Channel, EdgeDevice, Site, Subscriber, SystemSetting, TalkGroup,
-                      DEFAULT_SYSTEM_SETTINGS, now)
+                      TalkgroupPatch, DEFAULT_SYSTEM_SETTINGS, now)
+from .rules import Affiliations, link_groups, site_list
 from .events import bus
 from .transcoder import TranscoderService
 
@@ -107,6 +108,8 @@ class Call:
     frames: int = 0
     record_id: int | None = None
     seq: int = 0
+    linked: frozenset = frozenset()      # talkgroups this call holds the floor on (patches)
+    parrot: list | None = None           # recorded (codec, payload) frames to echo back
 
     def summary(self, ctl: "CallController") -> dict:
         return {
@@ -115,6 +118,7 @@ class Call:
             "src_label": ctl.endpoint_label(self.src_key), "codec": self.codec.name, "state": self.state,
             "emergency": self.emergency, "via_sip": self.via_sip, "started": self.started,
             "dests": [ctl.endpoint_label(k) for k in self.dests], "frames": self.frames,
+            "linked": sorted(self.linked - {self.tg}), "parrot": self.parrot is not None or self.src_key.startswith("parrot:"),
         }
 
 
@@ -133,6 +137,11 @@ class CallController:
         self.unit_aliases: dict[int, str] = {}
         self.stats = {"calls_granted": 0, "calls_denied": 0, "frames_routed": 0, "frames_dropped": 0}
         self.sip_gateway = None  # set by main
+        self.links: dict[int, frozenset[int]] = {}   # tg -> patched talkgroup set
+        self.tg_rules: dict[int, dict] = {}
+        self.affiliations = Affiliations()
+        self.aff_timeout = 1800.0
+        self._parrot_ids = itertools.count(1)
 
     # -------------------------------------------------------------- helpers
     def endpoint(self, key: str) -> Endpoint | None:
@@ -149,8 +158,23 @@ class CallController:
 
     def refresh_names(self) -> None:
         with session_scope() as db:
-            self.tg_names = {t.id: t.name for t in db.query(TalkGroup).all()}
+            tgs = db.query(TalkGroup).all()
+            self.tg_names = {t.id: t.name for t in tgs}
+            self.tg_rules = {t.id: {"site_ids": site_list(t.site_ids), "affiliated_only": t.affiliated_only,
+                                    "parrot": t.parrot, "restricted": t.restricted} for t in tgs}
             self.unit_aliases = {s.id: s.alias for s in db.query(Subscriber).all()}
+            self.links = link_groups([p.to_dict() for p in db.query(TalkgroupPatch).all()])
+            self.aff_timeout = float(get_system_settings(db).get("affiliation_timeout_s", 1800))
+
+    def linked(self, tg: int) -> frozenset[int]:
+        return self.links.get(tg, frozenset({tg}))
+
+    def floor_call(self, tg: int) -> "Call | None":
+        for t in self.linked(tg):
+            call = self.calls.get(self.tg_calls.get(t, -1))
+            if call:
+                return call
+        return None
 
     def site_codec(self, site: Site, vocoders: set[str]) -> Codec:
         if site.network_codec and site.network_codec != "AUTO":
@@ -291,9 +315,15 @@ class CallController:
         log.info("imported %d site-trunking call records from site %d", len(calls), site_id)
 
     # ------------------------------------------------------------ floor control
-    def _authorize(self, db, tg: TalkGroup | None, unit: int, sysset: dict) -> str | None:
+    def _authorize(self, db, tg: TalkGroup | None, unit: int, sysset: dict, site_id: int = 0) -> str | None:
         if not tg or not tg.enabled:
             return "unknown_talkgroup"
+        if site_id and site_list(tg.site_ids) and site_id not in site_list(tg.site_ids):
+            return "site_not_permitted"
+        if tg.restricted:
+            sub = db.get(Subscriber, unit) if unit else None
+            if not sub or tg.id not in {t.id for t in sub.talkgroups}:
+                return "not_permitted"
         if unit:
             sub = db.get(Subscriber, unit)
             if not sub:
@@ -309,18 +339,31 @@ class CallController:
             return "unknown_unit"
         return None
 
-    def _destinations(self, db, tg_id: int, exclude_key: str, exclude_channel: int | None) -> dict[str, list[int]]:
+    def _site_allowed(self, tg: int, site_id: int, src_site: int) -> bool:
+        rule = self.tg_rules.get(tg, {})
+        if rule.get("site_ids") and site_id not in rule["site_ids"]:
+            return False
+        if rule.get("affiliated_only") and site_id != src_site:
+            return site_id in self.affiliations.sites_for(tg, self.aff_timeout)
+        return True
+
+    def _destinations(self, db, tg_id: int, exclude_key: str, exclude_channel: int | None,
+                      src_site: int = 0) -> dict[str, list[int]]:
+        if self.tg_rules.get(tg_id, {}).get("parrot"):
+            return {}  # parrot: nobody hears it live; it is echoed back to the talker
+        group = self.linked(tg_id)
         dests: dict[str, list[int]] = {}
         for sid, sess in self.sessions.items():
             if sess.mode == "site_trunking":
                 continue
             chans = [cid for cid, c in sess.channels.items()
-                     if c.get("talkgroup_id") == tg_id and c.get("enabled") and c.get("role", "voice") == "voice"
+                     if c.get("talkgroup_id") in group and c.get("enabled") and c.get("role", "voice") == "voice"
+                     and self._site_allowed(c["talkgroup_id"], sid, src_site)
                      and not (sess.key == exclude_key and cid == exclude_channel)]
             if chans:
                 dests[sess.key] = chans
         for key, leg in self.sip_legs.items():
-            if getattr(leg, "tg", None) == tg_id and key != exclude_key:
+            if getattr(leg, "tg", None) in group and key != exclude_key:
                 dests[key] = []
         return dests
 
@@ -333,11 +376,11 @@ class CallController:
         with session_scope() as db:
             sysset = get_system_settings(db)
             tg = db.get(TalkGroup, tg_id)
-            reason = self._authorize(db, tg, unit, sysset)
+            reason = self._authorize(db, tg, unit, sysset, src.site_id)
             prio = (EMERGENCY_PRIORITY if emergency and tg and tg.emergency_enabled else (tg.priority if tg else 0))
             hang = tg.hang_time_ms if tg else int(sysset["default_hang_time_ms"])
 
-            existing = self.calls.get(self.tg_calls.get(tg_id, -1))
+            existing = self.floor_call(tg_id)
             if not reason and existing and existing.state == "active" and existing.src_key != src.key:
                 if prio > existing.priority:
                     await self._preempt(existing)
@@ -353,13 +396,15 @@ class CallController:
                     await src.send(deny)
                 return deny
 
-            dests = self._destinations(db, tg_id, src.key, channel)
-            existing = self.calls.get(self.tg_calls.get(tg_id, -1))
+            self.affiliations.heard(unit, src.site_id, tg_id)
+            dests = self._destinations(db, tg_id, src.key, channel, src.site_id)
+            existing = self.floor_call(tg_id)
             if existing:  # reuse during hang time (or same source re-key): keep call id, update floor
                 call = existing
                 old_dests = dict(call.dests)
                 call.src_key, call.src_site, call.src_channel, call.src_id = src.key, src.site_id, channel, unit
                 call.codec, call.state, call.last_voice = src.codec, "active", time.time()
+                call.tg = tg_id  # a reply may come in on the other side of a patch
                 call.emergency, call.priority = call.emergency or emergency, max(call.priority, prio)
                 call.dests = dests
                 self.transcoder.close(call.call_id)
@@ -370,7 +415,10 @@ class CallController:
             else:
                 call = Call(call_id=next(self._ids) & 0xFFFFFFFF, tg=tg_id, priority=prio, hang_ms=hang,
                             src_key=src.key, src_site=src.site_id, src_channel=channel, src_id=unit,
-                            codec=src.codec, emergency=emergency, via_sip=src.key.startswith("sip:"), dests=dests)
+                            codec=src.codec, emergency=emergency, via_sip=src.key.startswith("sip:"), dests=dests,
+                            linked=self.linked(tg_id))
+                if self.tg_rules.get(tg_id, {}).get("parrot"):
+                    call.parrot = []
                 rec = CallRecord(call_id=call.call_id, talkgroup_id=tg_id, source_id=unit,
                                  source_site_id=src.site_id, source_channel_id=channel,
                                  source_codec=src.codec.name, emergency=call.emergency, via_sip=call.via_sip,
@@ -379,7 +427,8 @@ class CallController:
                 db.flush()
                 call.record_id = rec.id
                 self.calls[call.call_id] = call
-                self.tg_calls[tg_id] = call.call_id
+                for t in call.linked:
+                    self.tg_calls[t] = call.call_id
         self._seen_unit(unit, src.site_id, tg_id)
         self.stats["calls_granted"] += 1
 
@@ -405,6 +454,11 @@ class CallController:
         call = self.calls.get(call_id)
         if not call or call.src_key != src_key or call.state != "active":
             return
+        if call.parrot is not None:
+            recording, src, channel = call.parrot, call.src_key, call.src_channel
+            await self.end_call(call.call_id, "parrot_recorded")
+            asyncio.get_running_loop().create_task(self._parrot_playback(call, recording, src, channel))
+            return
         call.state = "hang"
         call.hang_until = time.time() + call.hang_ms / 1000
         bus.publish("call_hang", call=call.summary(self))
@@ -413,8 +467,9 @@ class CallController:
         call = self.calls.pop(call_id, None)
         if not call:
             return
-        if self.tg_calls.get(call.tg) == call_id:
-            del self.tg_calls[call.tg]
+        for t in call.linked | {call.tg}:
+            if self.tg_calls.get(t) == call_id:
+                del self.tg_calls[t]
         transcoded = self.transcoder.close(call_id)
         for key in call.dests:
             ep = self.endpoint(key)
@@ -439,6 +494,43 @@ class CallController:
                 if reason == "preempted":
                     rec.result = "preempted"
         bus.publish("call_end", call_id=call_id, tg=call.tg, reason=reason, duration=round(dur, 1))
+
+    async def _parrot_playback(self, orig: Call, recording: list, src_key: str, channel: int | None) -> None:
+        """Echo a parrot-talkgroup transmission back to the radio that sent it."""
+        with session_scope() as db:
+            delay = int(get_system_settings(db).get("parrot_delay_ms", 1000)) / 1000
+        await asyncio.sleep(delay)
+        ep = self.endpoint(src_key)
+        if not ep or not recording or self.floor_call(orig.tg):
+            return
+        call = Call(call_id=next(self._ids) & 0xFFFFFFFF, tg=orig.tg, priority=orig.priority, hang_ms=0,
+                    src_key=f"parrot:{next(self._parrot_ids)}", src_site=0, src_channel=None, src_id=orig.src_id,
+                    codec=ep.codec, dests={src_key: [channel] if channel else []}, linked=frozenset({orig.tg}))
+        self.calls[call.call_id] = call
+        self.tg_calls[orig.tg] = call.call_id
+        await ep.call_started(call, [channel] if channel else [])
+        bus.publish("call_start", call=call.summary(self))
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        for i, (codec, payload) in enumerate(recording):
+            if call.call_id not in self.calls:
+                return  # preempted
+            if codec == ep.codec:
+                ep.send_frame(VoiceFrame(FrameType.VOICE, codec, 0, call.call_id, call.tg, call.src_id,
+                                         i & 0xFFFF, 0, payload))
+                call.frames += 1
+            await asyncio.sleep(max(0.0, t0 + (i + 1) * 0.02 - loop.time()))
+        await self.end_call(call.call_id, "parrot_done")
+
+    def network_status(self) -> dict:
+        sites = []
+        for sid, sess in sorted(self.sessions.items()):
+            sites.append({"site_id": sid, "label": sess.label, "mode": sess.mode, "codec": sess.codec.name,
+                          "voice_bound": bool(sess.voice_addr), "remote_ip": sess.remote_ip,
+                          "heartbeat_age_s": round(time.time() - sess.last_heartbeat, 1),
+                          "vocoders": sorted(sess.vocoders)})
+        return {"sites": sites, "affiliations": self.affiliations.table(self.aff_timeout),
+                "links": {tg: sorted(g) for tg, g in self.links.items()}}
 
     async def watchdog(self) -> None:
         while True:
@@ -471,6 +563,8 @@ class CallController:
         call.last_voice = time.time()
         call.frames += 1
         call.seq = (call.seq + 1) & 0xFFFF
+        if call.parrot is not None and frame.payload and len(call.parrot) < 50 * 120:
+            call.parrot.append((frame.codec, frame.payload))
         if frame.type == FrameType.VOICE_END:
             asyncio.get_running_loop().create_task(self.source_ended(call.call_id, src_key))
         targets: dict[Codec, list[Endpoint]] = {}

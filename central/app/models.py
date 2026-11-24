@@ -59,6 +59,9 @@ class Site(DictMixin, Base):
     network_codec: Mapped[str] = mapped_column(String(8), default="AUTO")  # AUTO|ULAW|IMBE|AMBE2|PCM16
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     notes: Mapped[str] = mapped_column(Text, default="")
+    callsign: Mapped[str] = mapped_column(String(16), default="")  # station ID sent in CW by the edge
+    latitude: Mapped[float] = mapped_column(Float, default=0.0)
+    longitude: Mapped[float] = mapped_column(Float, default=0.0)
     # runtime
     status: Mapped[str] = mapped_column(String(16), default="offline")  # offline|online|site_trunking
     last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
@@ -108,6 +111,11 @@ class TalkGroup(DictMixin, Base):
     hang_time_ms: Mapped[int] = mapped_column(Integer, default=3000)
     emergency_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     allow_sip: Mapped[bool] = mapped_column(Boolean, default=False)
+    # routing rules
+    restricted: Mapped[bool] = mapped_column(Boolean, default=False)      # only radios that list this TG may talk
+    affiliated_only: Mapped[bool] = mapped_column(Boolean, default=False) # repeat only at sites with an affiliated radio
+    parrot: Mapped[bool] = mapped_column(Boolean, default=False)          # echo each transmission back (test TG)
+    site_ids: Mapped[str] = mapped_column(String(256), default="")        # comma list of allowed sites; blank = all
     sip_extension: Mapped[str] = mapped_column(String(32), default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -141,6 +149,10 @@ class Channel(DictMixin, Base):
     rx_gain_db: Mapped[float] = mapped_column(Float, default=0.0)
     tx_gain_db: Mapped[float] = mapped_column(Float, default=0.0)
     default_unit_id: Mapped[int] = mapped_column(Integer, default=0)
+    # radio interface signalling: GPIO pins, or a serial port's RTS (PTT) / CTS (COR) lines
+    signaling: Mapped[str] = mapped_column(String(8), default="gpio")   # gpio | serial
+    serial_port: Mapped[str] = mapped_column(String(64), default="")
+    cor_invert: Mapped[bool] = mapped_column(Boolean, default=False)    # serial: CTS low = carrier
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
     site = relationship("Site", back_populates="channels")
@@ -167,6 +179,27 @@ class Subscriber(DictMixin, Base):
         d = super().to_dict()
         d["talkgroup_ids"] = [t.id for t in self.talkgroups]
         return d
+
+
+class BandPlanEntry(DictMixin, Base):
+    """Channel identity: channel number n is base + n * spacing; the receive (input) is offset from transmit."""
+    __tablename__ = "band_plan"
+    id: Mapped[int] = mapped_column(primary_key=True)  # identity 0..15
+    name: Mapped[str] = mapped_column(String(64), default="")
+    base_mhz: Mapped[float] = mapped_column(Float)
+    spacing_khz: Mapped[float] = mapped_column(Float, default=6.25)
+    offset_mhz: Mapped[float] = mapped_column(Float, default=5.0)
+    bandwidth_khz: Mapped[float] = mapped_column(Float, default=12.5)
+
+
+class TalkgroupPatch(DictMixin, Base):
+    """Links two talkgroups: a call on either is heard on both (across modes; the router transcodes)."""
+    __tablename__ = "talkgroup_patches"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(64))
+    tg_a: Mapped[int] = mapped_column(ForeignKey("talkgroups.id", ondelete="CASCADE"))
+    tg_b: Mapped[int] = mapped_column(ForeignKey("talkgroups.id", ondelete="CASCADE"))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class SipRoute(DictMixin, Base):
@@ -225,4 +258,7 @@ DEFAULT_SYSTEM_SETTINGS = {
     "wide_area_message": "WIDE AREA RESTORED",
     "default_hang_time_ms": "3000",
     "max_call_s": "120",
+    "affiliation_timeout_s": "1800",   # a radio counts as affiliated at a site this long after it was heard
+    "cw_id_interval_s": "600",         # edges identify each transmitter in CW at most this often
+    "parrot_delay_ms": "1000",
 }

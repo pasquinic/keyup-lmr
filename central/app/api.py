@@ -16,8 +16,9 @@ from lmrcommon.modes import MODE_CODEC, MODE_LABELS, SystemMode
 from . import schemas as S
 from .config import settings
 from .db import get_db
-from .models import (CallRecord, Channel, EdgeDevice, EnrollmentToken, SipRoute, Site, Subscriber,
-                     SystemSetting, TalkGroup, User, now)
+from .models import (BandPlanEntry, CallRecord, Channel, EdgeDevice, EnrollmentToken, SipRoute, Site, Subscriber,
+                     SystemSetting, TalkGroup, TalkgroupPatch, User, now)
+from .services import rules
 from .security import current_user, hash_secret, issue_token, verify_secret
 from .services.call_controller import get_system_settings
 from .services.events import bus
@@ -108,6 +109,8 @@ crud("sites", Site, S.SiteIn, Site.id)
 crud("talkgroups", TalkGroup, S.TalkGroupIn, TalkGroup.id)
 crud("channels", Channel, S.ChannelIn, Channel.site_id, pk_in_body=False)
 crud("sip/routes", SipRoute, S.SipRouteIn, SipRoute.id, pk_in_body=False)
+crud("bandplan", BandPlanEntry, S.BandPlanIn, BandPlanEntry.id)
+crud("patches", TalkgroupPatch, S.PatchIn, TalkgroupPatch.id, pk_in_body=False)
 
 
 # subscribers need the talkgroup many-to-many
@@ -180,6 +183,7 @@ def frequency_plan(db: Session = Depends(get_db)):
     chans = db.query(Channel).order_by(Channel.tx_mhz).all()
     sites = {s.id: s.name for s in db.query(Site).all()}
     tx = Counter(round(c.tx_mhz, 5) for c in chans if c.tx_mhz)
+    plan = [b.to_dict() for b in db.query(BandPlanEntry).all()]
     rows = []
     for c in chans:
         warn = []
@@ -187,9 +191,46 @@ def frequency_plan(db: Session = Depends(get_db)):
             warn.append("TX frequency reused at another site/slot (check spacing & simulcast intent)")
         if c.rx_mhz and c.tx_mhz and abs(c.rx_mhz - c.tx_mhz) < 0.0001 and c.mode != "ANALOG":
             warn.append("simplex: RX = TX")
+        slot = rules.locate_channel(c.tx_mhz, c.rx_mhz, plan) if plan else rules.ChannelSlot(None, 0, [])
         rows.append({**c.to_dict(), "site_name": sites.get(c.site_id, "?"),
-                     "codec": MODE_CODEC[SystemMode(c.mode)].name, "warnings": warn})
+                     "codec": MODE_CODEC[SystemMode(c.mode)].name, "warnings": warn + slot.problems,
+                     "identity": slot.identity, "channel_no": slot.number})
     return rows
+
+
+# ============================================================== network view
+def _checks(db) -> list[dict]:
+    return rules.config_checks([x.to_dict() for x in db.query(Site).all()],
+                               [x.to_dict() for x in db.query(Channel).all()],
+                               [x.to_dict() for x in db.query(TalkGroup).all()],
+                               [x.to_dict() for x in db.query(TalkgroupPatch).all()],
+                               [x.to_dict() for x in db.query(BandPlanEntry).all()],
+                               [x.to_dict() for x in db.query(EdgeDevice).all()])
+
+
+@router.get("/network", dependencies=admin)
+def network(db: Session = Depends(get_db)):
+    """Live network view: connected sites, each channel's COR/PTT state, affiliations, config checks."""
+    net = state.ctl.network_status()
+    names = {c.id: c for c in db.query(Channel).all()}
+    for site in net["sites"]:
+        dev = db.query(EdgeDevice).filter(EdgeDevice.site_id == site["site_id"], EdgeDevice.connected.is_(True)).first()
+        tel = json.loads(dev.telemetry or "{}") if dev else {}
+        site["channels"] = [{**ch, "slot": names[ch["id"]].slot if ch.get("id") in names else None}
+                            for ch in tel.get("channels", [])]
+        site["telemetry"] = {k: tel.get(k) for k in ("cpu_temp_c", "load", "uptime_s", "version", "local_calls")}
+    subs = {s.id: s.alias for s in db.query(Subscriber).all()}
+    for a in net["affiliations"]:
+        a["alias"] = subs.get(a["unit"], "")
+    net["checks"] = _checks(db)
+    return net
+
+
+@router.get("/network/preview", dependencies=admin)
+def network_preview(site_id: int, db: Session = Depends(get_db)):
+    """The configuration KeyUp pushes to a site's edge device."""
+    _get_or_404(db, Site, site_id)
+    return state.ctl.build_config(db, site_id)
 
 
 # ============================================================== settings

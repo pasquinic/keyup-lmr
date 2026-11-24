@@ -32,8 +32,11 @@ class GpioAudioChannel(RadioChannel):
         self._stream = None
 
     async def start(self):
+        self._start_signaling()
+        self._start_audio()
+
+    def _start_signaling(self) -> None:
         from gpiozero import DigitalInputDevice, DigitalOutputDevice
-        import sounddevice as sd
 
         c = self.cfg
         self._cor_dev = DigitalInputDevice(c["cor_gpio"], pull_up=bool(c.get("cor_active_low", True)),
@@ -41,15 +44,20 @@ class GpioAudioChannel(RadioChannel):
         self._cor_dev.when_activated = lambda: self.loop.call_soon_threadsafe(self.report_cor, True, 0)
         self._cor_dev.when_deactivated = lambda: self.loop.call_soon_threadsafe(self.report_cor, False, 0)
         self._ptt_dev = DigitalOutputDevice(c["ptt_gpio"], active_high=True, initial_value=False)
-        device = c.get("audio_device") or None
+        if self._cor_dev.is_active:
+            self.loop.call_soon(self.report_cor, True, 0)
+        log.info("channel %s: COR gpio%s PTT gpio%s", self.id, c["cor_gpio"], c["ptt_gpio"])
+
+    def _start_audio(self) -> None:
+        import sounddevice as sd
+
+        device = self.cfg.get("audio_device") or None
         if device == "default":
             device = None
         self._stream = sd.RawStream(samplerate=8000, channels=1, dtype="int16", blocksize=160,
                                     device=device, callback=self._cb, latency="low")
         self._stream.start()
-        if self._cor_dev.is_active:
-            self.loop.call_soon(self.report_cor, True, 0)
-        log.info("channel %s: COR gpio%s PTT gpio%s audio %s", self.id, c["cor_gpio"], c["ptt_gpio"], device)
+        log.info("channel %s: audio %s", self.id, device or "default")
 
     def _cb(self, indata, outdata, frames, time_info, status):  # PortAudio thread
         if self.cor:

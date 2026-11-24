@@ -32,6 +32,7 @@ class RadioChannel:
         self.tx_queue: collections.deque[bytes] = collections.deque(maxlen=250)  # 5 s
         self._unkey_task: asyncio.Task | None = None
         self.keyed_at = 0.0
+        self.cw_keyed = False  # PTT is held for the CW station ID
         self.announcing = False  # PTT is held only for a local tone/announcement
 
     # -- lifecycle
