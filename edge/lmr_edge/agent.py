@@ -14,6 +14,7 @@ import websockets
 from lmrcommon import audio
 from lmrcommon.modes import Codec
 from lmrcommon.protocol import FrameType, Msg, VoiceFrame, make_keepalive, Flags
+from lmrcommon.supervisor import Supervisor, write_instances
 from lmrcommon.vocoder import VocoderPool, VocoderUnavailable
 
 from . import __version__
@@ -23,6 +24,9 @@ from .state import State
 
 log = logging.getLogger("agent")
 HW_KEYS = ("audio_device", "ptt_gpio", "cor_gpio", "cor_active_low")
+FNE_UP = ("logged into the master successfully",)
+FNE_DOWN = ("connection to the master has timed out", "login attempt to the master has timed out",
+            "is non-responsive", "master disconnect")
 
 
 @dataclass
@@ -61,6 +65,12 @@ class EdgeAgent:
         self.started = time.time()
         self.stats = {"frames_tx": 0, "frames_rx": 0, "calls_tx": 0, "calls_rx": 0, "local_calls": 0}
         self.loop: asyncio.AbstractEventLoop | None = None
+        # DVM backend: dvmhost / dvmbridge processes supervised locally
+        self.backend = self.cached.get("backend", "native")
+        self.dvm_root = os.path.join(cfg["state_dir"], "dvm", "instances")
+        self.dvm_sup: Supervisor | None = None
+        self.dvm_link: dict[str, tuple[bool, float]] = {}   # instance -> (fne logged in, since)
+        self.dvm_meta: dict[str, dict] = {}
 
     # ================================================================ helpers
     def channels_cfg(self) -> list[dict]:
@@ -97,10 +107,65 @@ class EdgeAgent:
         self.cached = cfg
         self.site_id = cfg["site"]["id"]
         self.network_codec = Codec[cfg.get("network_codec", "ULAW")]
+        self.backend = cfg.get("backend", "native")
         self.state.set(cached_config=cfg, site_id=self.site_id)
+        if self.backend == "dvm":
+            await self._sync_dvm()
+            return
         await self._sync_radios()
         log.info("config applied: site %s, %d channels, net codec %s", cfg["site"]["name"],
                  len(self.channels_cfg()), self.network_codec.name)
+
+    # ================================================================ DVM backend
+    async def _sync_dvm(self) -> None:
+        """Write the dvmhost/dvmbridge instances central generated for this site and supervise them."""
+        for r in list(self.radios.values()):  # native radio backends are not used with DVM
+            await r.stop()
+        self.radios.clear()
+        dvm = self.cached.get("dvm") or {}
+        instances = dvm.get("instances", {})
+        if not dvm.get("license_acknowledged"):
+            log.warning("DVM license not acknowledged on the central server; DVM processes not started")
+        changed = write_instances(self.dvm_root, instances, prune_prefixes=("ch", "ana"))
+        self.dvm_meta = {k: {x: v[x] for x in ("binary", "channel_id", "peer_id", "rest_port") if x in v}
+                         for k, v in instances.items()}
+        for w, msgs in (dvm.get("warnings") or {}).items():
+            for m in msgs:
+                log.warning("config %s: %s", w, m)
+        if changed:
+            log.info("DVM instances updated: %s", ", ".join(sorted(changed)))
+        if self.dvm_sup is None:
+            bin_dir = self.cfg.get("dvm", {}).get("bin_dir", "")
+            self.dvm_sup = Supervisor(self.dvm_root, bin_dir, on_line=self._dvm_line)
+            self.dvm_sup.start_thread()
+            log.info("DVM supervisor started (bin dir %s)", bin_dir or "$PATH")
+
+    def _dvm_line(self, name: str, line: str) -> None:  # supervisor reader thread
+        up = any(p in line for p in FNE_UP)
+        down = any(p in line for p in FNE_DOWN)
+        if up or down:
+            self.loop.call_soon_threadsafe(self._dvm_link_change, name, up)
+
+    def _dvm_link_change(self, name: str, up: bool) -> None:
+        prev = self.dvm_link.get(name, (None, 0))[0]
+        if prev != up:
+            self.dvm_link[name] = (up, time.time())
+            log.info("%s: FNE link %s", name, "UP" if up else "DOWN")
+            if up:
+                self.last_link_ok = time.time()
+
+    def dvm_fne_up(self) -> bool | None:
+        """True if any DVM instance is logged into the FNE, False if all are down, None if unknown."""
+        if not self.dvm_link:
+            return None
+        return any(up for up, _ in self.dvm_link.values())
+
+    def dvm_status(self) -> list[dict]:
+        out = []
+        for st in (self.dvm_sup.status() if self.dvm_sup else []):
+            up, since = self.dvm_link.get(st["name"], (None, 0))
+            out.append({**st, **self.dvm_meta.get(st["name"], {}), "fne_link": up, "fne_link_since": since})
+        return out
 
     async def _sync_radios(self) -> None:
         want = {c["id"]: c for c in self.channels_cfg()}
@@ -384,7 +449,10 @@ class EdgeAgent:
     async def enter_site_trunking(self) -> None:
         if self.mode == "site_trunking":
             return
-        log.warning("central unreachable for %.0fs -> SITE TRUNKING", time.time() - self.last_link_ok)
+        if self.backend == "dvm":
+            log.warning("all DVM instances lost the FNE -> SITE TRUNKING (dvmhost broadcasts it on air)")
+        else:
+            log.warning("central unreachable for %.0fs -> SITE TRUNKING", time.time() - self.last_link_ok)
         self.mode, self.mode_since = "site_trunking", time.time()
         for call_id in list(self.inbound):
             self._call_end(call_id)
@@ -415,7 +483,14 @@ class EdgeAgent:
                 self.connected = False
                 if self.ws:
                     self._task(self.ws.close())
-            if self.mode != "site_trunking" and not self.connected and silent > self.st_timeout and self.cached:
+            if self.backend == "dvm":
+                fne_up = self.dvm_fne_up()
+                down_since = max((since for up, since in self.dvm_link.values() if not up), default=0)
+                if self.mode != "site_trunking" and fne_up is False and time.time() - down_since > self.st_timeout:
+                    await self.enter_site_trunking()  # dvmhost itself already broadcasts site trunking on air
+                elif self.mode == "site_trunking" and fne_up and self.connected:
+                    await self.exit_site_trunking()
+            elif self.mode != "site_trunking" and not self.connected and silent > self.st_timeout and self.cached:
                 await self.enter_site_trunking()
             if self.mode == "site_trunking":
                 interval = self.setting("site_trunking_announce_interval_s", 300)
@@ -435,7 +510,8 @@ class EdgeAgent:
 
     def _telemetry(self) -> dict:
         t = {"version": __version__, "mode": self.mode, "uptime_s": round(time.time() - self.started),
-             "vocoders": self.vocoders(), "channels": [r.status() for r in self.radios.values()], **self.stats}
+             "vocoders": self.vocoders(), "channels": [r.status() for r in self.radios.values()],
+             "backend": self.backend, "dvm": self.dvm_status(), **self.stats}
         try:
             t["cpu_temp_c"] = round(int(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000, 1)
         except Exception:
@@ -489,7 +565,7 @@ class EdgeAgent:
 
     async def _restore_after_config(self) -> None:
         await asyncio.sleep(0.5)  # config arrives right after hello_ack
-        if self.mode == "site_trunking":
+        if self.mode == "site_trunking" and (self.backend != "dvm" or self.dvm_fne_up()):
             await self.exit_site_trunking()
         elif self.state.get("pending_logs"):
             await self.send({"type": Msg.CALL_LOG_UPLOAD, "calls": self.state.get("pending_logs")})
@@ -526,8 +602,12 @@ class EdgeAgent:
 
         self.transport, _ = await self.loop.create_datagram_endpoint(VoiceProto, local_addr=("0.0.0.0", 0))
         if self.cached:
-            await self._sync_radios()
-            log.info("started from cached config (%d channels)", len(self.radios))
+            if self.backend == "dvm":
+                await self._sync_dvm()  # keeps the site on the air (site trunking) even if central is down
+                log.info("started DVM instances from cached config")
+            else:
+                await self._sync_radios()
+                log.info("started from cached config (%d channels)", len(self.radios))
         from .localapi import serve
         await serve(self, self.cfg["local_api"]["host"], int(self.cfg["local_api"]["port"]))
         await asyncio.gather(self.control_loop(), self.monitor_loop())

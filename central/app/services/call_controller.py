@@ -133,6 +133,7 @@ class CallController:
         self.unit_aliases: dict[int, str] = {}
         self.stats = {"calls_granted": 0, "calls_denied": 0, "frames_routed": 0, "frames_dropped": 0}
         self.sip_gateway = None  # set by main
+        self.fne = None          # FneMonitor when call_backend == dvm
 
     # -------------------------------------------------------------- helpers
     def endpoint(self, key: str) -> Endpoint | None:
@@ -176,8 +177,15 @@ class CallController:
             if s.home_site_id == site_id or not ids or ids & tg_ids:
                 subs.append({"id": s.id, "alias": s.alias, "home": s.home_site_id == site_id,
                              "talkgroups": sorted(ids), "notify": s.notify_site_trunking})
-        return {"type": Msg.CONFIG, "site": site.to_dict(), "channels": channels, "talkgroups": tgs,
-                "subscribers": subs, "settings": sysset}
+        cfg = {"type": Msg.CONFIG, "site": site.to_dict(), "channels": channels, "talkgroups": tgs,
+               "subscribers": subs, "settings": sysset, "backend": sysset.get("call_backend", "dvm")}
+        if cfg["backend"] == "dvm":
+            from .dvm import DvmPlan
+            plan = DvmPlan(db)
+            cfg["dvm"] = {"license_acknowledged": plan.ack,
+                          "instances": plan.site_instances(site_id) if plan.ack else {},
+                          "warnings": plan.warnings}
+        return cfg
 
     async def push_config(self, site_id: int) -> None:
         sess = self.sessions.get(site_id)
@@ -254,8 +262,13 @@ class CallController:
         t = msg.get("type")
         if t == Msg.HEARTBEAT:
             sess.last_heartbeat = time.time()
-            sess.mode = msg.get("mode", "wide_area")
-            self._set_site_status(sess.site_id, "online", device_id=sess.device_id, telemetry=msg.get("telemetry", {}))
+            mode = msg.get("mode", "wide_area")
+            if mode != sess.mode:
+                bus.publish("site", site_id=sess.site_id, status=mode if mode == "site_trunking" else "online",
+                            detail={"mode": mode})
+            sess.mode = mode
+            self._set_site_status(sess.site_id, "site_trunking" if mode == "site_trunking" else "online",
+                                  device_id=sess.device_id, telemetry=msg.get("telemetry", {}))
             await sess.send({"type": Msg.HEARTBEAT_ACK, "ts": time.time()})
         elif t == Msg.CALL_REQUEST:
             await self.request_call(sess, msg)
@@ -529,10 +542,13 @@ class CallController:
         self.route_frame(sess.key, frame)
 
     def status(self) -> dict:
+        calls = [c.summary(self) for c in self.calls.values()]
+        if self.fne is not None:
+            calls += list(self.fne.active.values())
         return {
             "sites_connected": len(self.sessions),
             "sip_legs": len(self.sip_legs),
-            "active_calls": [c.summary(self) for c in self.calls.values()],
+            "active_calls": calls,
             **self.stats,
         }
 

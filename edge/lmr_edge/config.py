@@ -20,6 +20,8 @@ DEFAULTS = {
     "wireguard": {"enabled": True, "interface": "lmr0", "config_dir": "/etc/wireguard"},
     "vocoder": {"dvsi_ports": [], "baud": 460800},
     "local_api": {"host": "127.0.0.1", "port": 8090},
+    # DVMProject binaries (dvmhost / dvmbridge) built by install.sh --with-dvm
+    "dvm": {"bin_dir": "/usr/local/bin"},
     "site_trunking": {
         "timeout_s": None,              # None = use central's system setting (default 10)
         "local_repeat": True,           # cross-patch local channels on the same TG

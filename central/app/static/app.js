@@ -141,8 +141,10 @@ pages.dashboard = async el => {
   const maxH = Math.max(1, ...Object.values(d.hourly)), maxT = Math.max(1, ...d.top_talkgroups.map(t => t.calls));
   liveCalls = Object.fromEntries(d.call_processing.active_calls.map(c => [c.call_id, c]));
   el.innerHTML = `
+  ${d.dvm && d.system.dvm_license_acknowledged !== "true" ? `<div class="card" style="border-color:var(--warn);margin-bottom:16px"><b style="color:var(--warn)">DVM not started.</b> Acknowledge the DVM license terms on the <a href="#/dvm">DVM Network</a> page.</div>` : ""}
   <div class="grid kpis">
     ${kpi(`${online}/${d.sites.length}`, "Sites online")}
+    ${d.dvm ? kpi(d.dvm.reachable ? `${d.dvm.peers.length}` : pill("down", "offline"), "FNE peers") : ""}
     ${kpi(`<span id="kActive">${d.call_processing.active_calls.length}</span>`, "Active calls")}
     ${kpi(d.calls_24h, "Calls · 24h")}
     ${kpi(d.denied_24h, "Denied / busy · 24h")}
@@ -159,12 +161,16 @@ pages.dashboard = async el => {
   <div class="grid three" style="margin-top:16px">
     <div class="card"><h3>Calls per hour (24h)</h3><div class="bars">${Object.entries(d.hourly).map(([h, n]) => `<div style="height:${n / maxH * 100}%" data-t="${h} · ${n}"></div>`).join("")}</div></div>
     <div class="card"><h3>Busiest talkgroups</h3>${d.top_talkgroups.map(t => `<div class="hbar"><span>${esc(t.name)}</span><span class="b" style="width:${t.calls / maxT * 100}%"></span><span class="mono">${t.calls}</span></div>`).join("") || '<div class="empty">No traffic</div>'}</div>
-    <div class="card"><h3>Transcoding</h3><dl class="kv">
+    ${d.dvm ? `<div class="card"><h3>DVM network</h3><dl class="kv">
+      <dt>FNE</dt><dd>${d.dvm.reachable ? pill("online") : pill("offline")}</dd>
+      <dt>Peers</dt><dd>${d.dvm.peers.length}</dd><dt>Affiliations</dt><dd>${d.dvm.affiliation_count}</dd>
+      <dt>Vocoding</dt><dd>dvmbridge (SIP, analog, cross-mode patches)</dd>
+      <dt>Site trunking</dt><dd>native on the air (dvmhost)</dd></dl><p><a href="#/dvm">DVM network details →</a></p></div>` : `<div class="card"><h3>Transcoding</h3><dl class="kv">
       <dt>DVSI vocoders</dt><dd>${d.transcoder.hardware_vocoders.length ? d.transcoder.hardware_vocoders.map(v => esc(v.port + " " + v.product)).join("<br>") : "none (IMBE/AMBE+2 conversions unavailable)"}</dd>
       <dt>Free / leased</dt><dd>${d.transcoder.free} / ${d.transcoder.leased}</dd>
       <dt>Active sessions</dt><dd>${d.transcoder.active_sessions}</dd>
       <dt>Transcoded calls</dt><dd>${d.transcoder.transcoded_calls}</dd>
-      <dt>Passthrough</dt><dd>P25P2 ⇄ DMR ⇄ NXDN (AMBE+2)</dd></dl></div>
+      <dt>Passthrough</dt><dd>P25P2 ⇄ DMR ⇄ NXDN (AMBE+2)</dd></dl></div>`}
     <div class="card"><h3>Call processing</h3><dl class="kv">
       <dt>Granted</dt><dd>${d.call_processing.calls_granted}</dd><dt>Denied</dt><dd>${d.call_processing.calls_denied}</dd>
       <dt>Frames routed</dt><dd id="kFrames">${d.call_processing.frames_routed}</dd><dt>Frames dropped</dt><dd>${d.call_processing.frames_dropped}</dd>
@@ -185,7 +191,7 @@ const siteCard = s => {
   const status = s.edge_mode === "site_trunking" ? "site_trunking" : s.status;
   return `<div class="site ${esc(status)}"><div class="n">${esc(s.id)} · ${esc(s.name)}</div>
   <div style="margin-top:6px">${pill(status)} ${s.mode_mix.map(m => pill(m, "mode")).join(" ")}</div>
-  <div class="meta">${esc(s.location || "")}<br>${s.channels} channel(s) · net codec ${esc(s.codec || "—")} · seen ${ago(s.last_seen)}</div></div>`;
+  <div class="meta">${esc(s.location || "")}<br>${s.channels} channel(s)${s.peers_up !== undefined ? ` · ${s.peers_up} on FNE` : ""} · seen ${ago(s.last_seen)}</div></div>`;
 };
 function drawLive() {
   const box = $("#liveCalls"); if (!box) return;
@@ -229,18 +235,25 @@ pages.sites = resourcePage({
   fields: [{name: "id", label: "Site number", type: "number", required: true, readonly: true}, {name: "name", label: "Name", required: true},
     {name: "location", label: "Location"}, {name: "rfss_id", label: "RFSS ID", type: "number", default: 1},
     {name: "network_codec", label: "Network codec", type: "select", options: ["AUTO", "ULAW", "PCM16", "IMBE", "AMBE2"], default: "AUTO"},
+    {name: "callsign", label: "CW ID callsign (blank = off)"}, {name: "latitude", label: "Latitude", type: "number"}, {name: "longitude", label: "Longitude", type: "number"},
     {name: "enabled", label: "Enabled", type: "bool", default: true}, {name: "notes", label: "Notes", type: "textarea", wide: true}],
 });
 
 pages.talkgroups = resourcePage({
   path: "talkgroups", title: "Talkgroup",
   columns: [{key: "id", label: "TGID"}, {key: "name", label: "Name"}, {key: "priority", label: "Priority"}, {key: "hang_time_ms", label: "Hang ms"},
-    {label: "Emergency", render: r => yes(r.emergency_enabled)}, {label: "SIP", render: r => r.allow_sip ? `${pill("yes")} <span class="mono">${esc(r.sip_extension || r.id)}</span>` : yes(false)}, {label: "Enabled", render: r => yes(r.enabled)}],
+    {label: "Emergency", render: r => yes(r.emergency_enabled)}, {label: "Rules", render: r => [r.affiliated_only && "affiliated", r.restricted && "restricted", r.parrot && "parrot", r.site_ids && "sites " + r.site_ids].filter(Boolean).map(esc).join(" · ") || '<span class="muted">open</span>'}, {label: "SIP", render: r => r.allow_sip ? `${pill("yes")} <span class="mono">${esc(r.sip_extension || r.id)}</span>` : yes(false)}, {label: "Enabled", render: r => yes(r.enabled)}],
   fields: [{name: "id", label: "TGID", type: "number", required: true, readonly: true}, {name: "name", label: "Name", required: true},
     {name: "description", label: "Description", wide: true}, {name: "priority", label: "Priority (1-10)", type: "number", default: 5},
     {name: "hang_time_ms", label: "Hang time (ms)", type: "number", default: 3000}, {name: "emergency_enabled", label: "Emergency calls allowed", type: "bool", default: true},
     {name: "allow_sip", label: "Allow SIP interconnect", type: "bool"}, {name: "sip_extension", label: "SIP dial extension", placeholder: "e.g. 7101"},
-    {name: "enabled", label: "Enabled", type: "bool", default: true}],
+    {name: "enabled", label: "Enabled", type: "bool", default: true},
+    {name: "dmr_slot", label: "DMR timeslot", type: "number", default: 1, group: "DVM talkgroup rules"},
+    {name: "affiliated_only", label: "Only repeat where affiliated", type: "bool", group: "DVM talkgroup rules"},
+    {name: "restricted", label: "Only subscribers listing this TG may talk", type: "bool", group: "DVM talkgroup rules"},
+    {name: "parrot", label: "Parrot (echo test) talkgroup", type: "bool", group: "DVM talkgroup rules"},
+    {name: "site_ids", label: "Limit to site numbers (comma list, blank = all)", group: "DVM talkgroup rules"},
+    {name: "bridge_mode", label: "Mode for SIP / analog bridges", type: "select", options: [{value: "P25P1", label: "P25"}, {value: "DMR", label: "DMR"}, {value: "ANALOG", label: "Analog"}], default: "P25P1", group: "DVM talkgroup rules"}],
 });
 
 const CHANNEL_FIELDS = [
@@ -257,12 +270,21 @@ const CHANNEL_FIELDS = [
   {name: "tx_delay_ms", label: "TX delay ms", type: "number", default: 150, group: "Edge hardware"}, {name: "tx_tail_ms", label: "TX tail ms", type: "number", default: 200, group: "Edge hardware"},
   {name: "rx_gain_db", label: "RX gain dB", type: "number", group: "Edge hardware"}, {name: "tx_gain_db", label: "TX gain dB", type: "number", group: "Edge hardware"},
   {name: "enabled", label: "Enabled", type: "bool", default: true, group: "Edge hardware"},
+  {name: "peer_id", label: "FNE peer ID (blank = auto)", type: "number", nullable: true, group: "DVM modem / dvmhost"},
+  {name: "modem_type", label: "Modem", type: "select", options: [{value: "uart", label: "UART (DVM-V1 / hotspot / V.24)"}, {value: "null", label: "Null (lab, no RF)"}], default: "uart", group: "DVM modem / dvmhost"},
+  {name: "modem_mode", label: "Modem mode", type: "select", options: [{value: "air", label: "Air interface (modem)"}, {value: "dfsi", label: "DFSI (V.24 via DVM-V24)"}], default: "air", group: "DVM modem / dvmhost"},
+  {name: "modem_port", label: "Modem / serial port (analog: RTS PTT + CTS COR)", default: "/dev/ttyUSB0", group: "DVM modem / dvmhost"},
+  {name: "modem_speed", label: "Serial speed", type: "number", default: 115200, group: "DVM modem / dvmhost"},
+  {name: "rx_level", label: "Modem RX level %", type: "number", default: 50, group: "DVM modem / dvmhost"},
+  {name: "tx_level", label: "Modem TX level %", type: "number", default: 50, group: "DVM modem / dvmhost"},
+  {name: "power_w", label: "TX power (W, informational)", type: "number", default: 10, group: "DVM modem / dvmhost"},
 ];
 pages.channels = resourcePage({
   path: "channels", listPath: "frequencies", title: "Channel",
   columns: [{label: "Site", render: r => `${esc(r.site_id)} · ${esc(r.site_name)}`}, {key: "slot", label: "Port"}, {key: "name", label: "Name"}, {label: "Mode", render: r => pill(r.mode, "mode")},
     {label: "RX / TX MHz", render: r => `<span class="mono">${mhz(r.rx_mhz)} / ${mhz(r.tx_mhz)}</span>`}, {label: "Access", render: r => esc(r.mode.startsWith("P25") ? "NAC " + r.nac : r.mode === "DMR" ? `CC${r.color_code} TS${r.timeslot}` : r.mode === "NXDN" ? "RAN " + r.ran : r.ctcss_hz ? r.ctcss_hz + " Hz" : "CSQ")},
-    {key: "talkgroup_id", label: "TG"}, {key: "codec", label: "Codec"}, {label: "GPIO", render: r => `<span class="mono">PTT ${r.ptt_gpio} / COR ${r.cor_gpio}</span>`},
+    {label: "Role", render: r => esc(r.role)}, {key: "talkgroup_id", label: "TG"}, {label: "DVM", render: r => `<span class="mono">peer ${esc(r.peer_id ?? "auto")}<br>${r.iden !== null && r.iden !== undefined ? `iden ${r.iden} ch ${r.ch_no}` : "—"}</span>`},
+    {label: "Modem", render: r => `<span class="mono">${esc(r.modem_type)} ${esc(r.modem_mode)}<br>${esc(r.modem_port)}</span>`},
     {label: "Checks", render: r => r.warnings.length ? `<div class="warnlist">${r.warnings.map(esc).join("<br>")}</div>` : pill("ok", "yes")}],
   fields: CHANNEL_FIELDS,
 });
@@ -366,7 +388,9 @@ pages.settings = async el => {
   const s = await api("/settings");
   const labels = {system_name: "System name", wacn: "WACN (hex)", system_id: "System ID (hex)", require_known_subscriber: "Require known subscriber (true/false)",
     site_trunking_timeout_s: "Site trunking after link loss (s)", site_trunking_announce_interval_s: "Site trunking re-announce interval (s)",
-    site_trunking_message: "Site trunking data message", wide_area_message: "Wide-area restored message", default_hang_time_ms: "Default hang time (ms)", max_call_s: "Max call duration (s)"};
+    site_trunking_message: "Site trunking data message", wide_area_message: "Wide-area restored message", default_hang_time_ms: "Default hang time (ms)", max_call_s: "Max call duration (s)",
+    call_backend: "Call backend (dvm | native)", dvm_license_acknowledged: "DVM license acknowledged (set on DVM page)", fne_peer_id: "FNE master peer ID",
+    fne_address: "FNE address edges dial (tunnel IP)", fne_port: "FNE port", dmr_net_id: "DMR network ID (hex)"};
   el.innerHTML = `<div class="grid two"><div class="card"><h3>System</h3><form id="sForm" class="formgrid">${Object.entries(s).map(([k, v]) => `<label>${esc(labels[k] || k)}<input name="${esc(k)}" value="${esc(v)}"></label>`).join("")}
     <div class="wide"><button class="btn primary">Save &amp; push to sites</button></div></form></div>
     <div class="card"><h3>Change password</h3><form id="pForm" class="formgrid"><label class="wide">Current<input type="password" name="old"></label><label class="wide">New (8+ chars)<input type="password" name="new"></label><div><button class="btn">Update</button></div></form></div></div>`;
@@ -374,8 +398,67 @@ pages.settings = async el => {
   $("#pForm").onsubmit = async e => { e.preventDefault(); try { await api("/auth/password", {method: "POST", body: Object.fromEntries(new FormData(e.target))}); toast("Password updated"); e.target.reset(); } catch (err) { toast(err.message, true); } };
 };
 
+
+pages.bandplan = resourcePage({
+  path: "idens", title: "Band Plan Entry",
+  columns: [{key: "id", label: "Iden"}, {key: "name", label: "Name"}, {label: "Base MHz", render: r => `<span class="mono">${Number(r.base_mhz).toFixed(5)}</span>`},
+    {label: "Spacing", render: r => `${r.spacing_khz} kHz`}, {label: "Input offset", render: r => `${r.offset_mhz >= 0 ? "+" : ""}${r.offset_mhz} MHz`}, {label: "Bandwidth", render: r => `${r.bandwidth_khz} kHz`}],
+  fields: [{name: "id", label: "Identity (0-15)", type: "number", required: true, readonly: true}, {name: "name", label: "Name", placeholder: "UHF 450"},
+    {name: "base_mhz", label: "Base frequency MHz", type: "number", required: true}, {name: "spacing_khz", label: "Channel spacing kHz", type: "number", default: 6.25},
+    {name: "offset_mhz", label: "Input offset MHz (RX = TX + offset)", type: "number", default: 5}, {name: "bandwidth_khz", label: "Bandwidth kHz", type: "number", default: 12.5}],
+  newDefaults: {spacing_khz: 6.25, offset_mhz: 5, bandwidth_khz: 12.5},
+});
+
+pages.patches = resourcePage({
+  path: "patches", title: "Patch",
+  columns: [{key: "name", label: "Name"}, {label: "Side A", render: r => `${pill(r.mode_a, "mode")} TG ${esc(r.tg_a)}`}, {label: "", render: () => "⇄"},
+    {label: "Side B", render: r => `${pill(r.mode_b, "mode")} TG ${esc(r.tg_b)}`}, {label: "Enabled", render: r => yes(r.enabled)}],
+  fields: [{name: "name", label: "Name", required: true}, {name: "tg_a", label: "Talkgroup A", type: "select", options: "talkgroups", numeric: true},
+    {name: "mode_a", label: "Mode A", type: "select", options: [{value: "DMR", label: "DMR"}, {value: "P25P1", label: "P25"}, {value: "ANALOG", label: "Analog"}]},
+    {name: "tg_b", label: "Talkgroup B", type: "select", options: "talkgroups", numeric: true},
+    {name: "mode_b", label: "Mode B", type: "select", options: [{value: "P25P1", label: "P25"}, {value: "DMR", label: "DMR"}, {value: "ANALOG", label: "Analog"}]},
+    {name: "enabled", label: "Enabled", type: "bool", default: true}],
+});
+
+const LICENSE_NOTE = "DVMProject software is provided for personal, non-commercial, hobbyist use and must never be used for public safety or life safety critical applications. Acknowledging sets DVM's iAgreeNotToBeStupid flag in every generated config.";
+pages.dvm = async el => {
+  const [d, sites] = await Promise.all([api("/dvm/status"), api("/sites")]);
+  const peers = d.fne?.peers || [];
+  const warns = Object.entries(d.warnings || {}).flatMap(([k, v]) => v.map(m => `${k}: ${m}`));
+  el.innerHTML = `
+  ${d.license_acknowledged ? "" : `<div class="card" style="border-color:var(--warn);margin-bottom:16px"><h3 style="color:var(--warn)">DVM license acknowledgement required</h3>
+    <p>${esc(LICENSE_NOTE)}</p><p class="muted">Until you acknowledge, KeyUp does not start the FNE, bridges or edge dvmhost instances.</p>
+    <button class="btn primary" id="ackBtn">I acknowledge — personal, non-commercial use only</button></div>`}
+  <div class="grid kpis">
+    ${kpi(d.fne?.reachable ? pill("online") : pill("offline"), "FNE")}
+    ${kpi(peers.length, "Peers connected")}
+    ${kpi(d.fne?.affiliation_count ?? 0, "Affiliations")}
+    ${kpi((d.fne?.active_calls || []).length, "Active calls")}
+  </div>
+  <div class="card" style="margin-top:16px"><h3>FNE peers</h3><div class="tablewrap"><table><thead><tr><th>Peer</th><th>Channel / bridge</th><th>Identity</th><th>Software</th><th>Address</th><th>Pings</th><th>Trunking</th></tr></thead><tbody>
+    ${peers.map(p => `<tr><td class="mono">${esc(p.peer_id)}</td><td>${esc(p.label || "unknown peer")}</td><td>${esc(p.identity || "")}</td><td class="muted">${esc(p.software || "")}</td>
+      <td class="mono">${esc(p.address || "")}</td><td>${esc(p.pings ?? "")}</td><td>${p.control_channel ? `voice ch of ${esc(p.control_channel)}` : ""}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">${d.fne?.reachable ? "No peers connected yet" : "FNE not reachable: " + esc(d.fne?.error || "")}</td></tr>`}
+  </tbody></table></div></div>
+  <div class="grid two" style="margin-top:16px">
+    <div class="card"><h3>Configuration checks</h3>${warns.length ? `<div class="warnlist">${warns.map(esc).join("<br>")}</div>` : pill("ok", "yes") + ' <span class="muted">no problems found</span>'}
+      <p class="muted">Central DVM instances: ${d.central_instances.map(esc).join(", ") || "none"}<br>DVM source pinned to <span class="mono">${esc(d.dvm_ref.slice(0, 10))}</span></p></div>
+    <div class="card"><h3>Generated configuration</h3>
+      <div class="toolbar"><select id="pvSite"><option value="">Central (FNE + bridges)</option>${sites.map(s => `<option value="${s.id}">Site ${s.id} · ${esc(s.name)}</option>`).join("")}</select><button class="btn" id="pvGo">Show</button></div>
+      <div id="pvOut" class="muted">Read-only preview of the files KeyUp writes for DVM.</div></div>
+  </div>`;
+  $("#ackBtn", el)?.addEventListener("click", async () => {
+    if (!confirm(LICENSE_NOTE + "\n\nAcknowledge?")) return;
+    await api("/settings", {method: "PUT", body: {dvm_license_acknowledged: "true"}}); toast("Acknowledged — starting DVM"); route();
+  });
+  $("#pvGo", el).onclick = async () => {
+    const sid = $("#pvSite").value, files = await api("/dvm/preview" + (sid ? `?site_id=${sid}` : ""));
+    $("#pvOut").innerHTML = Object.entries(files).map(([name, i]) => `<details><summary class="mono">${esc(name)} — ${esc(i.binary)} ${esc(i.args.join(" "))}</summary>
+      ${Object.entries(i.files).map(([f, c]) => `<p class="mono">${esc(f)}</p><div class="code" style="max-height:300px;overflow:auto">${esc(c)}</div>`).join("")}</details>`).join("") || "Nothing generated for this selection.";
+  };
+};
+
 // ------------------------------------------------------------------ router
-const TITLES = {dashboard: "Dashboard", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
+const TITLES = {dashboard: "Dashboard", dvm: "DVM Network (FNE)", bandplan: "Band Plan (Iden Table)", patches: "Cross-mode Patches", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
   subscribers: "Subscriber Radios", sip: "SIP Interconnect", calls: "Call History", settings: "System Settings"};
 async function route() {
   const page = (location.hash.slice(2).split("?")[0]) || "dashboard";

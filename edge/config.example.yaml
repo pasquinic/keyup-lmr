@@ -20,6 +20,12 @@ vocoder:
   dvsi_ports: []                # e.g. [/dev/ttyUSB0]
   baud: 460800
 
+# DVMProject binaries built by install.sh (dvmhost per RF channel, dvmbridge per analog radio).
+# With the DVM backend (default) central pushes their configs; radio_backend is only used by the
+# legacy native backend.
+dvm:
+  bin_dir: /usr/local/bin
+
 local_api:
   host: 127.0.0.1
   port: 8090

@@ -16,8 +16,9 @@ from lmrcommon.modes import MODE_CODEC, MODE_LABELS, SystemMode
 from . import schemas as S
 from .config import settings
 from .db import get_db
-from .models import (CallRecord, Channel, EdgeDevice, EnrollmentToken, SipRoute, Site, Subscriber,
-                     SystemSetting, TalkGroup, User, now)
+from .models import (CallRecord, Channel, EdgeDevice, EnrollmentToken, IdenEntry, Patch, SipRoute, Site,
+                     Subscriber, SystemSetting, TalkGroup, User, now)
+from .services import dvm
 from .security import current_user, hash_secret, issue_token, verify_secret
 from .services.call_controller import get_system_settings
 from .services.events import bus
@@ -30,6 +31,12 @@ admin = [Depends(current_user)]
 
 
 async def changed():
+    if state.fne is not None:
+        try:
+            await dvm.apply(state.fne)
+        except Exception as e:  # never block a UI save on config generation
+            import logging
+            logging.getLogger("api").exception("DVM apply failed: %s", e)
     if state.ctl:
         await state.ctl.push_all_configs()
 
@@ -67,6 +74,16 @@ def _get_or_404(db, model, pk):
     return obj
 
 
+def _fixup(db, obj) -> None:
+    """Model-specific defaults/validation shared by create and update."""
+    if isinstance(obj, Channel):
+        if not obj.peer_id:
+            obj.peer_id = dvm.default_peer_id(obj.site_id, obj.slot)
+        clash = db.query(Channel).filter(Channel.peer_id == obj.peer_id, Channel.id != obj.id).first()
+        if clash:
+            raise HTTPException(409, f"peer id {obj.peer_id} already used by channel {clash.name}")
+
+
 def crud(path: str, model, schema, order=None, pk_in_body=True):
     @router.get(f"/{path}", dependencies=admin, name=f"list_{path}")
     def list_(db: Session = Depends(get_db)):
@@ -81,6 +98,7 @@ def crud(path: str, model, schema, order=None, pk_in_body=True):
         if pk_in_body and db.get(model, data["id"]):
             raise HTTPException(409, f"id {data['id']} already exists")
         obj = model(**data)
+        _fixup(db, obj)
         db.add(obj)
         db.commit()
         await changed()
@@ -92,6 +110,7 @@ def crud(path: str, model, schema, order=None, pk_in_body=True):
         for k, v in body.model_dump().items():
             if k != "id":
                 setattr(obj, k, v)
+        _fixup(db, obj)
         db.commit()
         await changed()
         return obj.to_dict()
@@ -108,6 +127,8 @@ crud("sites", Site, S.SiteIn, Site.id)
 crud("talkgroups", TalkGroup, S.TalkGroupIn, TalkGroup.id)
 crud("channels", Channel, S.ChannelIn, Channel.site_id, pk_in_body=False)
 crud("sip/routes", SipRoute, S.SipRouteIn, SipRoute.id, pk_in_body=False)
+crud("idens", IdenEntry, S.IdenIn, IdenEntry.id)
+crud("patches", Patch, S.PatchIn, Patch.id, pk_in_body=False)
 
 
 # subscribers need the talkgroup many-to-many
@@ -179,6 +200,7 @@ def frequency_plan(db: Session = Depends(get_db)):
     """System-wide frequency plan with simple conflict detection."""
     chans = db.query(Channel).order_by(Channel.tx_mhz).all()
     sites = {s.id: s.name for s in db.query(Site).all()}
+    idens = [i.to_dict() for i in db.query(IdenEntry).order_by(IdenEntry.id).all()]
     tx = Counter(round(c.tx_mhz, 5) for c in chans if c.tx_mhz)
     rows = []
     for c in chans:
@@ -187,9 +209,37 @@ def frequency_plan(db: Session = Depends(get_db)):
             warn.append("TX frequency reused at another site/slot (check spacing & simulcast intent)")
         if c.rx_mhz and c.tx_mhz and abs(c.rx_mhz - c.tx_mhz) < 0.0001 and c.mode != "ANALOG":
             warn.append("simplex: RX = TX")
+        iden, chno, iw = dvm.channel_number(c.tx_mhz, c.rx_mhz, idens) if c.tx_mhz else (None, 0, [])
+        if c.mode == "P25P2" and _backend(db) == "dvm":
+            warn.append("P25 Phase II is not supported by DVM")
         rows.append({**c.to_dict(), "site_name": sites.get(c.site_id, "?"),
-                     "codec": MODE_CODEC[SystemMode(c.mode)].name, "warnings": warn})
+                     "codec": MODE_CODEC[SystemMode(c.mode)].name, "warnings": warn + iw,
+                     "iden": iden["id"] if iden else None, "ch_no": chno})
     return rows
+
+
+def _backend(db) -> str:
+    return get_system_settings(db).get("call_backend", "dvm")
+
+
+# ============================================================== DVM
+@router.get("/dvm/status", dependencies=admin)
+def dvm_status(db: Session = Depends(get_db)):
+    plan = dvm.DvmPlan(db)
+    central = plan.central_instances() if plan.ack else {}
+    for sid in plan.sites:
+        plan.site_instances(sid)  # collects warnings
+    return {"backend": _backend(db), "license_acknowledged": plan.ack, "dvm_ref": dvm.DVM_REF,
+            "fne": state.fne.status() if state.fne else None,
+            "central_instances": sorted(central), "warnings": plan.warnings}
+
+
+@router.get("/dvm/preview", dependencies=admin)
+def dvm_preview(site_id: int | None = None, db: Session = Depends(get_db)):
+    """Show the generated DVM files (FNE when site_id is omitted)."""
+    plan = dvm.DvmPlan(db)
+    inst = plan.site_instances(site_id) if site_id else plan.central_instances()
+    return {name: {"binary": i["binary"], "args": i["args"], "files": i["files"]} for name, i in inst.items()}
 
 
 # ============================================================== settings
@@ -401,6 +451,7 @@ def dashboard(db: Session = Depends(get_db)):
     for s in db.query(Site).order_by(Site.id).all():
         sess = state.ctl.sessions.get(s.id)
         sites.append({**s.to_dict(), "channels": len(s.channels),
+                      "peers_up": sum(1 for p in (state.fne.peers.values() if state.fne else []) if p.get("site_id") == s.id),
                       "mode_mix": sorted({c.mode for c in s.channels}),
                       "codec": sess.codec.name if sess else None,
                       "edge_mode": sess.mode if sess else None})
@@ -420,6 +471,7 @@ def dashboard(db: Session = Depends(get_db)):
         "hourly": hourly,
         "sites": sites,
         "call_processing": state.ctl.status(),
+        "dvm": state.fne.status() if state.fne else None,
         "transcoder": state.transcoder.status(),
         "sip": state.sip.status() if state.sip else {"enabled": False},
         "wireguard": {"enabled": state.wg.enabled, "interface": state.wg.interface,
