@@ -86,6 +86,13 @@ async def lifespan(app: FastAPI):
         except Exception:
             log.exception("DVM config generation failed")
         tasks.append(asyncio.create_task(state.fne.run()))
+        from .services.poc import PocGateway
+        from .services.tg_audio import TgAudioHub
+        state.ctl.hub = TgAudioHub(state.fne)
+        state.ctl.hub.refresh()
+        state.ctl.poc = state.poc = PocGateway(state.ctl)
+        state.fne.poc = state.poc
+        tasks.append(asyncio.create_task(state.poc.run()))
     if settings.ari_enabled:
         from .services.sip_gateway import SipGateway
         state.sip = SipGateway(state.ctl)
@@ -176,6 +183,17 @@ async def edge_ws(ws: WebSocket):
         log.exception("edge ws error")
     finally:
         await state.ctl.unregister_edge(sess)
+
+
+# ------------------------------------------------------------ PoC (cellular subscriber radios)
+@app.websocket("/poc/ws")
+async def poc_ws(ws: WebSocket):
+    if state.poc is None:
+        await ws.accept()
+        await ws.send_text(json.dumps({"t": "auth_fail", "reason": "poc_requires_dvm_backend"}))
+        await ws.close(code=4003)
+        return
+    await state.poc.handle(ws)
 
 
 # ------------------------------------------------------------ dashboard live feed

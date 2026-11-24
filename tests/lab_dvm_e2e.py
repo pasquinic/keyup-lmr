@@ -9,6 +9,8 @@ Runs KeyUp central, the DVM supervisor (dvmfne + dvmbridges) and two edge agents
   * a P25 trunked site (control + voice channel) registers its voice channel with the CC
   * SIP-side audio -> dvmbridge -> P25 call on the FNE, recorded in KeyUp call history
   * cross-mode patch: that P25 call is re-vocoded onto a DMR talkgroup
+  * PoC phones (protocol client): activation, talkgroup rules, a phone transmits as its own
+    radio ID, phone-to-phone and radio-to-phone audio, busy / not-permitted denials, inhibit
   * FNE outage -> edges report SITE TRUNKING; FNE back -> wide area
 """
 import json
@@ -20,11 +22,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import asyncio
 import urllib.request
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 from lmrcommon import audio  # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+from poc_client import PocClient, activate  # noqa: E402
 
 BIN = os.environ.get("DVM_BIN_DIR", "")
 PORT = 18180
@@ -51,6 +56,68 @@ def wait(pred, timeout=30, msg=""):
             pass
         time.sleep(0.5)
     raise AssertionError(f"timeout waiting for {msg}")
+
+
+async def poc_checks(tokens: dict, tmp: str) -> str:
+    a, b = PocClient(BASE, tokens[1001]), PocClient(BASE, tokens[2002])
+    pa, pb = await a.connect(), await b.connect()
+    assert pa["t"] == "auth_ok" and [t["id"] for t in pa["talkgroups"]] == [100], pa
+    await a.select(100)
+    await b.select(100)
+    # phone A talks: the FNE must see A's own radio ID; phone B hears it locally
+    g = await a.talk(100, 2.0)
+    assert g["t"] == "grant", g
+    await asyncio.sleep(1.5)
+    log = open(f"{tmp}/dvm.log").read()
+    assert "P25, Call Start, peer = 9100000" in log and "srcId = 1001, dstId = 100" in log, "PoC srcId not on FNE"
+    assert b.rx_frames.get(100, 0) > 60 and 1001 in b.rx_srcs, (b.rx_frames, b.rx_srcs)
+    assert "DMR, Call Start, peer = 92000" in log, "patch did not re-vocode the PoC call onto DMR"
+    calls = req("GET", "/api/calls")
+    assert any(c["source_id"] == 1001 and c["talkgroup_id"] == 100 for c in calls), calls[:3]
+    # radio -> phone: a P25 call from the patch bridge reaches phone B, and A can't key over it (busy)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    b.rx_frames.clear()
+    b.events = [e for e in b.events if e.get("t") != "rx_start"]
+    await asyncio.sleep(0.8)
+    for i in range(100):
+        s.sendto(struct.pack("!BBHII", 0x80, 0, i, i * 160, 9) + audio.pcm_to_ulaw(audio.tone(1200, 20, 0.4, i * 160)),
+                 ("127.0.0.1", 36003))  # patch-1-b UDP input -> P25 TG 100 on the FNE
+        if i == 60:
+            await a.send({"t": "ptt", "on": True, "tg": 100})
+        await asyncio.sleep(0.02)
+    deny = await a.wait_event_any(("deny", "grant"))
+    assert deny == {"t": "deny", "tg": 100, "reason": "busy"}, deny
+    await asyncio.sleep(1.0)
+    assert b.rx_frames.get(100, 0) > 40 and 9200003 in b.rx_srcs, (b.rx_frames, b.rx_srcs)
+    rx = await b.wait_event("rx_start")
+    assert rx["src"] == 9200003, rx
+    # not permitted
+    await b.send({"t": "ptt", "on": True, "tg": 1})
+    assert (await b.wait_event("deny"))["reason"] == "not_permitted"
+    # inhibit unit 1001 from the console: its phone is cut off like a radio
+    sub = [x for x in req("GET", "/api/subscribers") if x["id"] == 1001][0]
+    req("PUT", "/api/subscribers/1001", {**sub, "enabled": False})
+    inh = await a.wait_event("inhibited")
+    assert inh["reason"] == "inhibited"
+    a2 = PocClient(BASE, tokens[1001])
+    assert (await a2.connect())["reason"] == "inhibited"
+    # the mobile app's own TypeScript client (Node runtime, synthetic mic) against the live server
+    mob = os.path.join(ROOT, "mobile")
+    if shutil.which("npx") and os.path.isdir(os.path.join(mob, "node_modules")):
+        b.rx_frames.clear()
+        out = subprocess.run(["npx", "tsx", "scripts/live-check.ts", BASE, tokens[2002], "2"], cwd=mob,
+                             capture_output=True, text=True, timeout=60)
+        res = json.loads(out.stdout.strip().splitlines()[-1])
+        assert res["link"] == "online" and res["granted"] and "talkPermit" in res["tones"], res
+        await asyncio.sleep(1.0)
+        log = open(f"{tmp}/dvm.log").read()
+        assert "srcId = 2002, dstId = 100" in log, "app client's transmission not seen on the FNE"
+        extra = "; mobile app TS client keyed TG 100 as RID 2002"
+    else:
+        extra = "; (mobile TS client check skipped: run npm install in mobile/)"
+    await b.close()
+    return (f"phone transmitted as RID 1001 (FNE + call history), phone-to-phone audio {sum(b.rx_frames.values())}+ "
+            f"frames, radio-to-phone with talker {rx['src']}, busy/not-permitted denials, inhibit enforced{extra}")
 
 
 def main():
@@ -101,19 +168,25 @@ def main():
         def peers():
             return {p["peer_id"]: p for p in (req("GET", "/api/dvm/status")["fne"] or {}).get("peers", [])}
         wait(lambda: len(peers()) == 6, 90, "3 dvmhosts + 3 dvmbridges logged into the FNE")
-        wait(lambda: peers()[100102]["control_channel"] == 100101, 60, "P25 voice channel registered with its CC")
+        wait(lambda: peers()[100102]["control_channel"] == 100101, 120, "P25 voice channel registered with its CC")
         print("ok  FNE accepted all generated configs: 3 dvmhost + 3 dvmbridge peers; P25 VC attached to CC")
 
-        recv, _ = 32000, 34000  # first SIP talkgroup
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        for i in range(150):
-            s.sendto(struct.pack("!BBHII", 0x80, 0, i, i * 160, 1) + audio.pcm_to_ulaw(audio.tone(900, 20, 0.4, i * 160)),
-                     ("127.0.0.1", recv))
-            time.sleep(0.02)
-        wait(lambda: any(c["talkgroup_id"] == 100 and c["via_sip"] for c in req("GET", "/api/calls")), 15, "SIP P25 call record")
-        log = open(f"{tmp}/dvm.log").read()
-        assert "DMR, Call Start, peer = 9200000" in log or "DMR, Call Start, peer = 92000" in log, "patch did not transcode"
-        print("ok  SIP audio -> dvmbridge -> P25 TG 100 call recorded; patch re-vocoded it onto DMR TG 1")
+        # ---------------------------------------------------------------- PoC phones
+        req("POST", "/api/subscribers", {"id": 1001, "alias": "Engine 1", "talkgroup_ids": [100]})
+        req("POST", "/api/subscribers", {"id": 2002, "alias": "Chief 2", "talkgroup_ids": [100]})
+        tokens = {}
+        for unit in (1001, 2002):
+            act = req("POST", f"/api/subscribers/{unit}/poc/activation", {})
+            assert act["qr_svg"].startswith("<svg") and act["uri"].startswith("keyup://activate")
+            tokens[unit] = activate(BASE, unit, act["code"])["token"]
+        try:
+            activate(BASE, 1001, act["code"])
+            raise AssertionError("activation code reused")
+        except Exception as e:
+            assert "403" in str(e), e
+        wait(lambda: len(peers()) == 6 and 9100000 in peers(), 60, "interconnect bridge for TG 100 up")
+        ps = asyncio.run(poc_checks(tokens, tmp))
+        print(f"ok  PoC: {ps}")
 
         procs.pop("sup").terminate()
         wait(lambda: all(req("GET", "/status", base=f"http://127.0.0.1:{18190 + n}", auth=False)["mode"] == "site_trunking"

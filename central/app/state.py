@@ -8,6 +8,7 @@ class AppState:
     transcoder = None  # TranscoderService
     sip = None         # SipGateway | None
     fne = None         # dvm.FneMonitor | None
+    poc = None         # poc.PocGateway | None
     started = 0.0
 
 

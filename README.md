@@ -46,12 +46,23 @@ KeyUp is a management and orchestration layer for a personal LMR network built o
 | Subscriber radios (enabled, permitted TGs) | `rid_acl.dat`; optionally reject unknown radio IDs |
 | Edge devices and channels | `peer_list.dat`: the FNE only accepts peers KeyUp knows about |
 | Control channels across sites | `adj_site_map.yml`, so radios can roam between neighbor sites |
-| SIP-enabled talkgroups | A `dvmbridge` per talkgroup, with UDP RTP G.711 to KeyUp's SIP gateway |
+| SIP-enabled talkgroups, and talkgroups PoC phones may use | One interconnect `dvmbridge` per talkgroup (raw PCM over UDP, with the source radio ID in metadata), shared by the SIP gateway and the PoC gateway |
 | Cross-mode patches | Two `dvmbridge`s connected back to back, which re-vocode, for example DMR ⇄ P25 |
 
 Saving anything in the UI regenerates these files. The FNE hot-reloads lookup changes through its REST API, and the supervisors restart a daemon only if its main config changed. Each site's files are pushed to its edge over the tunnel.
 
 **Site trunking** is handled by DVM itself. When a site's `dvmhost` loses the FNE, it keeps repeating locally and clears the *network active* flag in its P25 (and NXDN/DMR) site broadcasts, so trunked subscriber radios show **SITE TRUNKING**. `updateLookups` and `saveLookups` are enabled, so the site keeps the last talkgroup and radio ID lists. The KeyUp edge agent detects the lost FNE link, reports the site as site trunking on the dashboard, and can drive a GPIO indicator or webhook.
+
+## PoC phones: cellular subscriber radios
+
+The **KeyUp PoC** app (`mobile/`, one React Native / Expo codebase for Android and iOS) makes a phone a subscriber radio over cellular or Wi-Fi. The phone uses a radio ID from **Subscriber Radios** and is held to the same rules as an RF radio:
+- **Permitted talkgroups:** only those the radio ID is allowed on; restricted talkgroups only if the ID lists them.
+- **Inhibit:** disabling the Subscriber logs the phone out at once.
+- **Radio ID rules on the FNE:** the phone's transmissions reach the FNE carrying its own radio ID, through a per-talkgroup interconnect `dvmbridge`, so the FNE's radio ID lists and permitted-ID checks apply.
+- **Busy and timeout:** busy rules and the system's maximum call time apply.
+- **Emergencies:** raise the dispatcher alarm.
+
+To provision a phone, press **PoC QR** on a subscriber, then scan the QR code in the app. Phones are managed on the **PoC Phones** page. Details are in `mobile/README.md` and `docs/poc-protocol.md`.
 
 ## Deploy the central server (Ubuntu Server 22.04 / 24.04)
 

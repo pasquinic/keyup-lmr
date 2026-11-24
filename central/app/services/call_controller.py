@@ -134,6 +134,8 @@ class CallController:
         self.stats = {"calls_granted": 0, "calls_denied": 0, "frames_routed": 0, "frames_dropped": 0}
         self.sip_gateway = None  # set by main
         self.fne = None          # FneMonitor when call_backend == dvm
+        self.hub = None          # TgAudioHub (SIP + PoC interconnect) when call_backend == dvm
+        self.poc = None          # PocGateway when call_backend == dvm
 
     # -------------------------------------------------------------- helpers
     def endpoint(self, key: str) -> Endpoint | None:

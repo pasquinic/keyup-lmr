@@ -41,6 +41,7 @@ class TalkGroupIn(BaseModel):
     parrot: bool = False
     site_ids: str = ""
     bridge_mode: Literal["P25P1", "DMR", "ANALOG"] = "P25P1"
+    allow_poc: bool = True
 
 
 class ChannelIn(BaseModel):
@@ -107,6 +108,7 @@ class SubscriberIn(BaseModel):
     notify_site_trunking: bool = True
     notes: str = ""
     talkgroup_ids: list[int] = []
+    poc_enabled: bool = False
 
 
 class SipRouteIn(BaseModel):
@@ -139,3 +141,11 @@ class OriginateIn(BaseModel):
     talkgroup_id: int
     ptt_mode: Literal["dtmf", "vox"] = "dtmf"
     caller_id: str = "LMR"
+
+
+class PocActivateIn(BaseModel):
+    unit: int
+    code: str
+    device_name: str = ""
+    platform: str = ""
+    app_version: str = ""

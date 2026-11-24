@@ -1,0 +1,70 @@
+{
+  "expo": {
+    "name": "KeyUp",
+    "slug": "keyup-poc",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.pasquinic.keyup",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "KeyUp uses the microphone while you hold push-to-talk.",
+        "NSCameraUsageDescription": "KeyUp uses the camera to scan your activation QR code."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.pasquinic.keyup",
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.CAMERA",
+        "android.permission.POST_NOTIFICATIONS"
+      ]
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-router",
+      [
+        "react-native-audio-api",
+        {
+          "iosMicrophonePermission": "KeyUp uses the microphone while you hold push-to-talk.",
+          "iosBackgroundMode": true,
+          "androidForegroundService": true,
+          "androidFSTypes": [
+            "mediaPlayback",
+            "microphone"
+          ],
+          "androidPermissions": [
+            "android.permission.FOREGROUND_SERVICE",
+            "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+            "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+            "android.permission.RECORD_AUDIO"
+          ],
+          "androidFSStopWithTask": true
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "KeyUp uses the camera to scan your activation QR code.",
+          "recordAudioAndroid": false
+        }
+      ]
+    ],
+    "scheme": "keyup",
+    "backgroundColor": "#0d1117",
+    "experiments": {
+      "typedRoutes": false
+    }
+  }
+}

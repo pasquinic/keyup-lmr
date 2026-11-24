@@ -69,7 +69,7 @@ def test_yaml_emitter_is_dvm_safe():
 
 def test_fne_files(plan):
     inst = plan.central_instances()
-    assert set(inst) == {"fne", "sip-tg100", "patch-1-a", "patch-1-b"}
+    assert set(inst) == {"fne", "ic-tg100", "patch-1-a", "patch-1-b"}
     files = inst["fne"]["files"]
     cfg = yaml.safe_load(files["config.yml"])
     assert cfg["iAgreeNotToBeStupid"] is True and cfg["system"]["peer_acl"]["enable"] is True
@@ -89,10 +89,13 @@ def test_fne_files(plan):
 
 def test_bridges(plan):
     inst = plan.central_instances()
-    sip = yaml.safe_load(inst["sip-tg100"]["files"]["config.yml"])
-    assert sip["network"]["destinationId"] == 100 and sip["system"]["txMode"] == 2
-    assert sip["system"]["udpAudio"] and sip["system"]["udpUseULaw"]
-    assert (sip["system"]["udpReceivePort"], sip["system"]["udpSendPort"]) == plan.sip_ports(100)
+    ic = yaml.safe_load(inst["ic-tg100"]["files"]["config.yml"])
+    assert ic["network"]["destinationId"] == 100 and ic["system"]["txMode"] == 2
+    assert ic["system"]["udpAudio"] and ic["system"]["udpMetadata"] and not ic["system"]["udpRTPFrames"]
+    assert ic["network"]["overrideSourceIdFromUDP"] is True        # phones transmit as their own radio ID
+    assert (ic["system"]["udpReceivePort"], ic["system"]["udpSendPort"]) == plan.ic_ports(100)
+    pa = yaml.safe_load(inst["patch-1-a"]["files"]["config.yml"])
+    assert pa["system"]["udpRTPFrames"] and not pa["system"]["udpMetadata"]
     a = yaml.safe_load(inst["patch-1-a"]["files"]["config.yml"])["system"]
     b = yaml.safe_load(inst["patch-1-b"]["files"]["config.yml"])["system"]
     assert a["txMode"] == 1 and b["txMode"] == 2                     # DMR <-> P25
@@ -128,3 +131,12 @@ def test_site_analog_and_warnings(plan):
     assert "doesn't match band plan" in warns and "not on any band plan" in warns
     ports = {i.get("rest_port") for s in (1, 2) for i in plan.site_instances(s).values() if i.get("rest_port")}
     assert len(ports) == 4  # unique across sites
+
+
+def test_poc_talkgroup_rules(plan):
+    open_unit = {"id": 7, "talkgroup_ids": [], "poc_enabled": True, "enabled": True}
+    pw_unit = {"id": 2002, "talkgroup_ids": [200], "poc_enabled": True, "enabled": True}
+    assert {t["id"] for t in plan.poc_talkgroups(open_unit)} == {1, 100}   # restricted TG 200 excluded
+    assert {t["id"] for t in plan.poc_talkgroups(pw_unit)} == {200}        # listed -> allowed
+    plan.poc_users = [pw_unit]
+    assert [t["id"] for t in plan.ic_tgs()] == [100, 200]                  # SIP TG + PoC user's TG

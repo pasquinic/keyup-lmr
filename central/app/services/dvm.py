@@ -6,7 +6,8 @@ compiled into DVM configuration:
   central (FNE container, <DVM_DIR>/instances/...)
     fne/            dvmfne config.yml, talkgroup_rules.yml, rid_acl.dat, peer_list.dat,
                     adj_site_map.yml, iden_table.dat
-    sip-tg<N>/      dvmbridge per SIP-enabled talkgroup (UDP RTP G.711 <-> KeyUp SIP gateway)
+    ic-tg<N>/       "interconnect" dvmbridge per talkgroup used by SIP or PoC (cellular) subscribers:
+                    raw PCM over UDP with srcId metadata, so a phone transmits as its own radio ID
     patch-<id>-a/b  two dvmbridges back to back = cross-mode patch (e.g. DMR TG <-> P25 TG)
 
   edge (pushed over the WireGuard control link to each site's Pi)
@@ -43,7 +44,7 @@ DVM_REF = "435ff45b367887ffa94c89cb1a2779628e0f7bfb"  # DVMProject/dvmhost commi
 MODE_PROTO = {"P25P1": "p25", "DMR": "dmr", "NXDN": "nxdn"}
 BRIDGE_TXMODE = {"DMR": 1, "P25P1": 2, "ANALOG": 3}
 FNE_INSTANCE = "fne"
-SIP_RECV_BASE, SIP_SEND_BASE = 32000, 34000   # dvmbridge listens on RECV, sends to KeyUp on SEND
+IC_RECV_BASE, IC_SEND_BASE = 32000, 34000     # dvmbridge listens on RECV, sends to KeyUp on SEND
 PATCH_PORT_BASE = 36000
 
 
@@ -154,6 +155,7 @@ class DvmPlan:
         self.channels = [c.to_dict() for c in db.query(Channel).order_by(Channel.site_id, Channel.slot).all()]
         self.tgs = [t.to_dict() for t in db.query(TalkGroup).order_by(TalkGroup.id).all()]
         self.subs = [s.to_dict() for s in db.query(Subscriber).order_by(Subscriber.id).all()]
+        self.poc_users = [s for s in self.subs if s.get("poc_enabled") and s.get("enabled")]
         self.idens = [i.to_dict() for i in db.query(IdenEntry).order_by(IdenEntry.id).all()]
         self.patches = [p.to_dict() for p in db.query(Patch).order_by(Patch.id).all()]
         self.warnings: dict[str, list[str]] = {}
@@ -175,18 +177,38 @@ class DvmPlan:
     def warn(self, key: str, msg: str) -> None:
         self.warnings.setdefault(key, []).append(msg)
 
-    def sip_tgs(self) -> list[dict]:
-        return [t for t in self.tgs if t["allow_sip"] and t["enabled"]]
+    def poc_talkgroups(self, sub: dict) -> list[dict]:
+        """Talkgroups a PoC subscriber may use -- the same permission rules as a radio:
+        its permitted TG list (empty = any), restricted TGs only if listed, TG enabled + PoC-capable."""
+        mine = set(sub.get("talkgroup_ids") or [])
+        out = []
+        for t in self.tgs:
+            if not t["enabled"] or not t.get("allow_poc", True) or t.get("bridge_mode") not in BRIDGE_TXMODE:
+                continue
+            if mine and t["id"] not in mine:
+                continue
+            if t.get("restricted") and t["id"] not in mine:
+                continue
+            out.append(t)
+        return out
 
-    def sip_ports(self, tg_id: int) -> tuple[int, int]:
-        idx = [t["id"] for t in self.sip_tgs()].index(tg_id)
-        return SIP_RECV_BASE + idx, SIP_SEND_BASE + idx
+    def ic_tgs(self) -> list[dict]:
+        """Talkgroups that need an interconnect bridge: SIP-enabled, or usable by an active PoC subscriber."""
+        poc = {t["id"] for s in self.poc_users for t in self.poc_talkgroups(s)}
+        return [t for t in self.tgs if t["enabled"] and (t["allow_sip"] or t["id"] in poc)]
+
+    def ic_ports(self, tg_id: int) -> tuple[int, int]:
+        idx = [t["id"] for t in self.ic_tgs()].index(tg_id)
+        return IC_RECV_BASE + idx, IC_SEND_BASE + idx
+
+    def ic_peer(self, tg_id: int) -> int:
+        return 9100000 + [t["id"] for t in self.ic_tgs()].index(tg_id)
 
     def bridge_peers(self) -> list[tuple[int, str, dict]]:
         """(peer_id, alias, meta) for every central dvmbridge."""
         out = []
-        for i, t in enumerate(self.sip_tgs()):
-            out.append((9100000 + i, f"SIP-TG{t['id']}", {"tg": t["id"]}))
+        for t in self.ic_tgs():
+            out.append((self.ic_peer(t["id"]), f"IC-TG{t['id']}", {"tg": t["id"], "interconnect": True}))
         for p in self.patches:
             if p["enabled"]:
                 out.append((9200000 + p["id"] * 2, f"PATCH{p['id']}-A", {"tg": p["tg_a"]}))
@@ -303,7 +325,9 @@ class DvmPlan:
     def bridge_config(self, *, peer_id: int, identity: str, tg: int, mode: str, slot: int = 1,
                       fne_host: str = "127.0.0.1", udp: tuple[int, int] | None = None,
                       local_audio: bool = False, serial_port: str = "", src_id: int = 0,
-                      grant_demand: bool = False) -> str:
+                      grant_demand: bool = False, metadata: bool = False) -> str:
+        """metadata=True: raw PCM16 UDP framed as [len][pcm][dstId][srcId] so the sender picks the
+        source radio ID per call (PoC/SIP). False: RTP G.711 (bridge-to-bridge patches)."""
         if mode not in BRIDGE_TXMODE:
             self.warn(identity, f"dvmbridge cannot speak {mode}; using P25")
             mode = "P25P1"
@@ -313,11 +337,11 @@ class DvmPlan:
             "txMode": BRIDGE_TXMODE[mode], "rxAudioGain": 1.0, "vocoderDecoderAudioGain": 3.0,
             "vocoderDecoderAutoGain": False, "txAudioGain": 1.0, "vocoderEncoderAudioGain": 3.0,
             "localAudio": local_audio, "voxSampleLevel": 80.0, "dropTimeMs": 180,
-            "udpAudio": bool(udp), "udpMetadata": False,
+            "udpAudio": bool(udp), "udpMetadata": metadata,
             "udpSendPort": udp[1] if udp else 34001, "udpSendAddress": "127.0.0.1",
             "udpReceivePort": udp[0] if udp else 32001, "udpReceiveAddress": "127.0.0.1",
-            "udpRTPFrames": True, "udpIgnoreRTPTiming": False, "udpRTPContinuousSeq": False,
-            "udpUseULaw": True, "udpUsrp": False, "udpFrameTiming": False,
+            "udpRTPFrames": not metadata, "udpIgnoreRTPTiming": False, "udpRTPContinuousSeq": False,
+            "udpUseULaw": not metadata, "udpUsrp": False, "udpFrameTiming": metadata,
             "rtsPttEnable": bool(serial_port), "rtsPttPort": serial_port or "/dev/ttyUSB0", "rtsPttHoldoffMs": 250,
             "ctsCorEnable": bool(serial_port), "ctsCorPort": serial_port or "/dev/ttyUSB0",
             "ctsCorInvert": False, "ctsCorHoldoffMs": 250,
@@ -330,7 +354,8 @@ class DvmPlan:
             "network": {"id": peer_id, "address": fne_host, "port": self.fne_port,
                         "password": secret("peer", peer_id), "encrypted": False,
                         "allowDiagnosticTransfer": True, "sourceId": src_id or peer_id,
-                        "overrideSourceIdFromMDC": False, "overrideSourceIdFromUDP": False,
+                        "overrideSourceIdFromMDC": False, "overrideSourceIdFromUDP": metadata,
+                        "resetCallForSourceIdChange": metadata,
                         "destinationId": tg, "slot": slot},
             "system": system,
         }
@@ -338,14 +363,12 @@ class DvmPlan:
 
     def central_instances(self) -> dict[str, dict]:
         inst = {FNE_INSTANCE: self.fne_instance()}
-        bp = {meta["tg"]: pid for pid, _, meta in self.bridge_peers() if _.startswith("SIP")}
-        for t in self.sip_tgs():
-            recv, send = self.sip_ports(t["id"])
-            name = f"sip-tg{t['id']}"
-            inst[name] = {"binary": "dvmbridge", "args": ["-f", "-c", "config.yml"], "files": {
-                "config.yml": self.bridge_config(peer_id=bp[t["id"]], identity=f"SIP{t['id']}"[:8], tg=t["id"],
+        for t in self.ic_tgs():
+            recv, send = self.ic_ports(t["id"])
+            inst[f"ic-tg{t['id']}"] = {"binary": "dvmbridge", "args": ["-f", "-c", "config.yml"], "files": {
+                "config.yml": self.bridge_config(peer_id=self.ic_peer(t["id"]), identity=f"IC{t['id']}"[:8], tg=t["id"],
                                                  mode=t.get("bridge_mode") or "P25P1", slot=t.get("dmr_slot") or 1,
-                                                 udp=(recv, send), grant_demand=True)}}
+                                                 udp=(recv, send), grant_demand=True, metadata=True)}}
         for p in self.patches:
             if not p["enabled"]:
                 continue
@@ -432,7 +455,7 @@ class DvmPlan:
                                       "rpcPort": edge_ports(site_id, cc["slot"])[0] if trunked and not is_cc else 0,
                                       "rpcPassword": secret("rpc", site_id),
                                       "notifyEnable": trunked and not is_cc,  # only voice channels notify their CC
-                                      "presence": 120},
+                                      "presence": 30},  # VC re-announces itself to the CC every 30 s
                         "voiceChNo": voice_list,
                         "colorCode": _int(c.get("color_code"), 1), "nac": _hex(c.get("nac"), "293"),
                         "ran": _int(c.get("ran"), 1), "pSuperGroup": "FFFE", "announcementGroup": "FFFE",
@@ -547,6 +570,7 @@ class FneMonitor:
         self.recent_end: dict[int, float] = {}  # streamId -> end time (FNE may log a late Start after End)
         self.meta: dict[int, dict] = {}
         self.error = ""
+        self.poc = None  # PocGateway, to label calls that come from phones
         self._log_path = ""
         self._log_pos = 0
 
@@ -606,10 +630,12 @@ class FneMonitor:
         if kind == "Start":
             if stream in self.active or time.time() - self.recent_end.get(stream, 0) < 10:
                 return
+            if self.poc is not None and self.poc.is_talking(dst, src):
+                info = {**info, "label": f"PoC phone ({info['label']})"}
             summary = {"call_id": stream, "tg": dst, "tg_name": self.ctl.tg_names.get(dst, str(dst)),
                        "src_id": src, "src_alias": self.ctl.unit_alias(src), "src_site": info.get("site_id", 0),
                        "src_label": info["label"], "codec": "UNIT" if private else mode.upper(), "state": "active",
-                       "emergency": False, "via_sip": info["label"].startswith("SIP"), "started": time.time(),
+                       "emergency": False, "via_sip": info["label"].startswith("IC-"), "started": time.time(),
                        "dests": [], "frames": 0, "peer_id": peer, "private": bool(private), "mode": mode}
             self.active[stream] = summary
             bus.publish("call_start", call=summary)
@@ -628,7 +654,7 @@ class FneMonitor:
                 db.add(CallRecord(call_id=stream & 0x7FFFFFFF, talkgroup_id=dst, source_id=src,
                                   source_site_id=info.get("site_id", 0), source_channel_id=info.get("channel_id"),
                                   source_codec=mode.upper(), started_at=dt.datetime.utcfromtimestamp(started),
-                                  ended_at=now(), duration_s=dur, via_sip=info["label"].startswith("SIP"),
+                                  ended_at=now(), duration_s=dur, via_sip=info["label"].startswith("IC-"),
                                   dest_sites=json.dumps([]), result="granted" if not private else "granted:private"))
                 s = db.get(Subscriber, src)
                 if s:
@@ -685,7 +711,7 @@ async def apply(monitor: FneMonitor | None) -> dict:
         plan = DvmPlan(db)
         instances = plan.central_instances() if plan.ack else {}
     root = os.path.join(settings.dvm_dir, "instances")
-    changed = write_instances(root, instances, prune_prefixes=("fne", "sip-", "patch-"))
+    changed = write_instances(root, instances, prune_prefixes=("fne", "sip-", "ic-", "patch-"))
     fne_changed = {c.split("/", 1)[1] for c in changed if c.startswith(f"{FNE_INSTANCE}/")}
     if monitor:
         monitor.refresh_meta()

@@ -119,7 +119,8 @@ class TalkGroup(DictMixin, Base):
     restricted: Mapped[bool] = mapped_column(Boolean, default=False)       # only subscribers that list this TG may transmit
     parrot: Mapped[bool] = mapped_column(Boolean, default=False)
     site_ids: Mapped[str] = mapped_column(String(256), default="")         # comma list; blank = all sites
-    bridge_mode: Mapped[str] = mapped_column(String(8), default="P25P1")   # mode the SIP bridge speaks on this TG
+    bridge_mode: Mapped[str] = mapped_column(String(8), default="P25P1")   # mode the SIP/PoC bridge speaks on this TG
+    allow_poc: Mapped[bool] = mapped_column(Boolean, default=True)         # selectable by PoC (cellular) subscribers
 
 
 class Channel(DictMixin, Base):
@@ -176,16 +177,36 @@ class Subscriber(DictMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     notify_site_trunking: Mapped[bool] = mapped_column(Boolean, default=True)
     notes: Mapped[str] = mapped_column(Text, default="")
+    # Push-to-talk over cellular: the phone app is this radio ID on the system
+    poc_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    poc_activation_hash: Mapped[str] = mapped_column(String(128), default="")
+    poc_activation_expires: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     last_site_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_tg_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     talkgroups = relationship("TalkGroup", secondary=subscriber_talkgroups, lazy="selectin")
+    _hidden = ("poc_activation_hash",)
 
     def to_dict(self):
         d = super().to_dict()
         d["talkgroup_ids"] = [t.id for t in self.talkgroups]
         return d
+
+
+class PocDevice(DictMixin, Base):
+    """A phone activated as a subscriber radio (one radio ID may have a few devices)."""
+    __tablename__ = "poc_devices"
+    _hidden = ("token_hash",)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    name: Mapped[str] = mapped_column(String(64), default="")
+    platform: Mapped[str] = mapped_column(String(16), default="")
+    app_version: Mapped[str] = mapped_column(String(16), default="")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+    last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class IdenEntry(DictMixin, Base):
