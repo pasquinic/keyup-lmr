@@ -35,6 +35,10 @@ admin = [Depends(current_user)]
 async def changed():
     if state.ctl:
         await state.ctl.push_all_configs()
+    if state.poc:
+        await state.poc.refresh()
+    if state.dispatch:
+        await state.dispatch.refresh()
 
 
 # ============================================================== auth
@@ -499,8 +503,8 @@ def list_zones(db: Session = Depends(get_db)):
 @router.post("/zones", dependencies=admin)
 async def create_zone(body: S.ZoneIn, db: Session = Depends(get_db)):
     z = Zone()
-    db.add(z)
     _apply_zone(db, z, body)
+    db.add(z)
     db.commit()
     await changed()
     return z.to_dict()
@@ -551,3 +555,66 @@ def export_zones(subscriber: int | None = None, db: Session = Depends(get_db)):
     fname = f"keyup-zones{'-' + str(subscriber) if subscriber else ''}.csv"
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+# ============================================================== PoC provisioning
+_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+@router.post("/subscribers/{pk}/poc/activation", dependencies=admin)
+async def poc_activation(pk: int, db: Session = Depends(get_db)):
+    """Enable PoC for a radio ID and issue a one-time activation code (+ QR) for the phone app."""
+    import segno
+    sub = _get_or_404(db, Subscriber, pk)
+    code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(8))
+    sub.poc_enabled = True
+    sub.poc_activation_hash = hash_secret(code)
+    sub.poc_activation_expires = now() + dt.timedelta(hours=24)
+    db.commit()
+    uri = f"keyup://activate?s={settings.public_url}&u={sub.id}&c={code}"
+    await changed()
+    return {"unit": sub.id, "alias": sub.alias, "code": code, "server": settings.public_url, "uri": uri,
+            "expires_at": sub.poc_activation_expires.isoformat() + "Z",
+            "qr_svg": segno.make(uri, error="m").svg_inline(scale=5, dark="#000", light="#fff")}
+
+
+@router.post("/poc/activate")
+def poc_activate(body: S.PocActivateIn, db: Session = Depends(get_db)):
+    """Called by the phone app: trade a one-time activation code for a device token."""
+    from .services.poc import new_token, token_hash
+    sub = db.get(Subscriber, body.unit)
+    code = body.code.strip().upper().replace("-", "").replace(" ", "")
+    if (not sub or not sub.poc_activation_hash or not sub.poc_activation_expires
+            or sub.poc_activation_expires < now() or not verify_secret(code, sub.poc_activation_hash)):
+        time.sleep(1)
+        raise HTTPException(403, "invalid or expired activation code")
+    if not sub.enabled:
+        raise HTTPException(403, "this radio is inhibited")
+    token = new_token()
+    sub.poc_activation_hash, sub.poc_activation_expires = "", None
+    db.add(PocDevice(subscriber_id=sub.id, token_hash=token_hash(token), name=body.device_name[:64],
+                     platform=body.platform[:16], app_version=body.app_version[:16]))
+    db.commit()
+    bus.publish("poc", action="activated", unit=sub.id, alias=sub.alias, platform=body.platform)
+    return {"token": token, "unit": sub.id, "alias": sub.alias, "ws_path": "/poc/ws"}
+
+
+@router.get("/poc/devices", dependencies=admin)
+def poc_devices(db: Session = Depends(get_db)):
+    online = {s["device_id"] for s in (state.poc.status()["sessions"] if state.poc else [])}
+    return [{**d.to_dict(), "online": d.id in online} for d in db.query(PocDevice).order_by(PocDevice.subscriber_id)]
+
+
+@router.post("/poc/devices/{pk}/revoke", dependencies=admin)
+async def poc_revoke(pk: int, db: Session = Depends(get_db)):
+    d = _get_or_404(db, PocDevice, pk)
+    d.revoked = True
+    db.commit()
+    if state.poc:
+        await state.poc.refresh()
+    return {"ok": True}
+
+
+@router.get("/poc/status", dependencies=admin)
+def poc_status():
+    return state.poc.status() if state.poc else {"sessions": [], "emergencies": {}}

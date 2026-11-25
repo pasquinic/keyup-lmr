@@ -8,8 +8,11 @@ import {
   Profile,
   ServerMessage,
   Talkgroup,
+  Zone,
   decodeDownlink,
   encodeUplink,
+  zoneFor,
+  zonesOf,
 } from './protocol';
 
 export type LinkState = 'idle' | 'connecting' | 'online' | 'offline' | 'refused';
@@ -21,6 +24,8 @@ export interface RadioState {
   unit: { id: number; alias: string } | null;
   systemName: string;
   talkgroups: Talkgroup[];
+  zones: Zone[];
+  zone: number | null; // zone shown (client-side, like a radio's zone knob)
   selected: number | null;
   scan: number[];
   scanOn: boolean;
@@ -67,7 +72,7 @@ const PRE_GRANT_MAX = 50; // keep up to 1 s of audio said before the grant arriv
 
 export class PocClient {
   state: RadioState = {
-    link: 'idle', network: false, unit: null, systemName: 'KeyUp', talkgroups: [], selected: null,
+    link: 'idle', network: false, unit: null, systemName: 'KeyUp', talkgroups: [], zones: [], zone: null, selected: null,
     scan: [], scanOn: false, tx: 'idle', txTg: null, txStarted: 0, rx: null, lastHeard: null,
     emergencies: {}, notice: null, refusedReason: null,
   };
@@ -193,7 +198,7 @@ export class PocClient {
         this.release(false);
         break;
       case 'selected':
-        this.set({ selected: m.tg, scan: m.scan, scanOn: m.scan_on });
+        this.set({ selected: m.tg, scan: m.scan, scanOn: m.scan_on, zone: zoneFor(this.state.zones, m.tg, this.state.zone) });
         break;
       case 'grant':
         if (this.state.tx === 'requesting' && this.pttHeld) {
@@ -248,9 +253,12 @@ export class PocClient {
 
   private applyProfile(p: Profile): void {
     const keep = this.state.selected && p.talkgroups.some((t) => t.id === this.state.selected);
+    const zones = zonesOf(p);
+    const selected = keep ? this.state.selected : p.selected;
     this.set({
       link: 'online', network: p.network, unit: p.unit, systemName: p.system.name, talkgroups: p.talkgroups,
-      selected: keep ? this.state.selected : p.selected, refusedReason: null,
+      zones, zone: zoneFor(zones, selected, this.state.zone),
+      selected, refusedReason: null,
       scan: this.state.scan.filter((id) => p.talkgroups.some((t) => t.id === id)),
     });
   }
@@ -262,10 +270,18 @@ export class PocClient {
   }
 
   // ------------------------------------------------------------------ user actions
-  select(tg: number): void {
+  select(tg: number, zone?: number): void {
     if (this.state.tx !== 'idle') return;
-    this.set({ selected: tg });
+    this.set({ selected: tg, zone: zone ?? zoneFor(this.state.zones, tg, this.state.zone) });
     this.send({ t: 'select', tg });
+  }
+
+  /** Turn the zone knob: show another zone and select its first talkgroup. */
+  setZone(zone: number): void {
+    const z = this.state.zones.find((x) => x.id === zone);
+    if (!z || this.state.tx !== 'idle') return;
+    const tg = z.talkgroups.includes(this.state.selected ?? -1) ? this.state.selected! : z.talkgroups[0];
+    this.select(tg, zone);
   }
 
   setScan(scan: number[], on: boolean): void {

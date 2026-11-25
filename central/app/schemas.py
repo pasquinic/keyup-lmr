@@ -163,3 +163,11 @@ class PatchIn(BaseModel):
     tg_a: int
     tg_b: int
     enabled: bool = True
+
+
+class PocActivateIn(BaseModel):
+    unit: int
+    code: str
+    device_name: str = ""
+    platform: str = ""
+    app_version: str = ""

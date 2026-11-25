@@ -73,6 +73,9 @@ async def lifespan(app: FastAPI):
     transport, _ = await loop.create_datagram_endpoint(lambda: VoiceProtocol(state.ctl),
                                                        local_addr=(settings.voice_bind, settings.voice_port))
     tasks = [asyncio.create_task(state.ctl.watchdog())]
+    from .services.poc import PocGateway
+    state.poc = PocGateway(state.ctl)
+    tasks.append(asyncio.create_task(state.poc.run()))
     if settings.ari_enabled:
         from .services.sip_gateway import SipGateway
         state.sip = SipGateway(state.ctl)
@@ -166,6 +169,12 @@ async def edge_ws(ws: WebSocket):
 
 
 # ------------------------------------------------------------ dashboard live feed
+@app.websocket("/poc/ws")
+async def poc_ws(ws: WebSocket):
+    """KeyUp PoC phone app (see services/poc.py and docs/poc-protocol.md)."""
+    await state.poc.handle(ws)
+
+
 @app.websocket("/ws/dashboard")
 async def dashboard_ws(ws: WebSocket):
     with session_scope() as db:

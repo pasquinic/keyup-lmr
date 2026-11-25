@@ -3,7 +3,7 @@ import * as Haptics from 'expo-haptics';
 import { useKeepAwake } from 'expo-keep-awake';
 import { router } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
-import { FlatList, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Modal, Pressable, SectionList, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { DENY_TEXT } from '../protocol';
@@ -62,13 +62,20 @@ export default function Radio() {
   }
 
   const tg = state.talkgroups.find((t) => t.id === state.selected) ?? null;
-  const idx = tg ? state.talkgroups.indexOf(tg) : -1;
+  const zone = state.zones.find((z) => z.id === state.zone) ?? state.zones[0] ?? null;
+  // the channel knob steps through the talkgroups of the current zone
+  const knob = zone ? zone.talkgroups : state.talkgroups.map((t) => t.id);
+  const idx = tg ? knob.indexOf(tg.id) : -1;
   const step = (d: number) => {
-    if (!state.talkgroups.length || state.tx !== 'idle') return;
-    const n = state.talkgroups[(idx + d + state.talkgroups.length) % state.talkgroups.length];
-    client?.select(n.id);
+    if (!knob.length || state.tx !== 'idle') return;
+    client?.select(knob[(idx + d + knob.length) % knob.length], zone?.id);
     void Haptics.selectionAsync();
   };
+  const byId = new Map(state.talkgroups.map((t) => [t.id, t]));
+  const sections = state.zones.map((z) => ({
+    zone: z,
+    data: z.talkgroups.map((id) => byId.get(id)).filter((t): t is NonNullable<typeof t> => !!t),
+  }));
   const tx = state.tx;
   const rx = state.rx;
   const emergencyHere = tg ? state.emergencies[tg.id] : undefined;
@@ -111,7 +118,9 @@ export default function Radio() {
         {emergencyHere && (
           <Text style={st.emergencyBanner}>EMERGENCY · {emergencyHere.alias} ({emergencyHere.src})</Text>
         )}
-        <Text style={st.zone}>{state.scanOn ? 'SCAN' : 'TALKGROUP'}</Text>
+        <Text style={st.zone}>
+          {(zone && state.zones.length > 1 ? zone.name.toUpperCase() : 'TALKGROUP') + (state.scanOn ? ' · SCAN' : '')}
+        </Text>
         <Text style={st.tgName} numberOfLines={1} adjustsFontSizeToFit>
           {tg ? tg.name : state.talkgroups.length ? 'Select a talkgroup' : 'No talkgroups'}
         </Text>
@@ -193,15 +202,24 @@ export default function Radio() {
       <Modal visible={picker} animationType="slide" transparent onRequestClose={() => setPicker(false)}>
         <View style={st.sheetWrap}>
           <View style={st.sheet}>
-            <Text style={st.sheetTitle}>Talkgroups</Text>
-            <FlatList
-              data={state.talkgroups}
-              keyExtractor={(t) => String(t.id)}
-              renderItem={({ item }) => (
+            <Text style={st.sheetTitle}>Zones & talkgroups</Text>
+            <SectionList
+              sections={sections}
+              keyExtractor={(t, i) => `${t.id}:${i}`}
+              stickySectionHeadersEnabled={false}
+              renderSectionHeader={({ section }) => (
+                <Pressable onPress={() => client?.setZone(section.zone.id)}>
+                  <Text style={[st.zoneHeader, section.zone.id === zone?.id && { color: C.accent },
+                    !!section.zone.color && { borderLeftColor: section.zone.color }]}>
+                    {section.zone.name}
+                  </Text>
+                </Pressable>
+              )}
+              renderItem={({ item, section }) => (
                 <Pressable
-                  style={[st.tgRow, item.id === state.selected && { backgroundColor: C.panel2 }]}
+                  style={[st.tgRow, item.id === state.selected && section.zone.id === zone?.id && { backgroundColor: C.panel2 }]}
                   onPress={() => {
-                    client?.select(item.id);
+                    client?.select(item.id, section.zone.id);
                     setPicker(false);
                   }}
                 >
@@ -227,6 +245,8 @@ const st = StyleSheet.create({
   screen: { flex: 1, backgroundColor: C.bg, paddingHorizontal: 16 },
   status: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 8 },
   dot: { width: 10, height: 10, borderRadius: 5 },
+  zoneHeader: { color: C.muted, fontSize: 12, fontWeight: '800', letterSpacing: 1, paddingTop: 14, paddingBottom: 6,
+    paddingLeft: 8, borderLeftWidth: 3, borderLeftColor: 'transparent', textTransform: 'uppercase' },
   statusText: { color: C.muted, fontSize: 12, fontWeight: '700', letterSpacing: 1 },
   display: {
     backgroundColor: C.panel, borderRadius: 14, borderWidth: 2, borderColor: C.line, padding: 18, minHeight: 190,

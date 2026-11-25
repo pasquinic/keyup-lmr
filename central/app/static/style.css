@@ -131,3 +131,6 @@ legend{color:var(--muted);font-size:12px;padding:0 6px}
 .ordered li span { flex: 1; }
 .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: middle; }
 .chip { display: inline-block; padding: 1px 6px; border-radius: 9px; background: var(--chip, rgba(127,127,127,.15)); margin: 1px 0; font-size: 12px; }
+
+.qr{background:#fff;border-radius:10px;padding:10px;display:inline-block}
+.qrwrap{display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start}

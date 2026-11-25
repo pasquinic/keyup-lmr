@@ -1,8 +1,13 @@
 """Central call processing: edge sessions, floor control, routing and the UDP voice router.
 
 Endpoints are anything that can source or sink a talkgroup call:
-  * EdgeSession -- one connected edge device (a site and its base radios)
-  * SipLeg      -- an Asterisk channel bridged to a talkgroup (see sip_gateway.py)
+  * EdgeSession    -- one connected edge device (a site, its base radios and packet-voice links)
+  * SipLeg         -- an Asterisk channel bridged to a talkgroup (see sip_gateway.py)
+  * PocSession     -- a phone running the KeyUp PoC app (see poc.py)
+  * ConsoleSession -- a KeyUp Dispatch Console monitoring many talkgroups (see dispatch.py)
+
+Everything except edge sessions is a "leg": it listens to talkgroups (listens()) and may take the
+floor through request_call() under the same rules as a radio.
 """
 from __future__ import annotations
 
@@ -47,10 +52,18 @@ class Endpoint:
     def send_frame(self, frame: VoiceFrame) -> None:
         raise NotImplementedError
 
+    def listens(self, group: frozenset) -> bool:
+        """Legs: does this endpoint want calls on any talkgroup in `group`? (SIP legs: their one TG.)"""
+        return getattr(self, "tg", None) in group
+
     async def call_started(self, call: "Call", channels: list[int]) -> None:
         pass
 
     async def call_ended(self, call: "Call", reason: str) -> None:
+        pass
+
+    async def preempted(self, call: "Call") -> None:
+        """This endpoint's own transmission was taken over (higher priority / emergency)."""
         pass
 
 
@@ -128,7 +141,7 @@ class CallController:
         self.transcoder = transcoder
         self.sessions: dict[int, EdgeSession] = {}          # site_id -> session
         self.addr_map: dict[tuple[str, int], EdgeSession] = {}
-        self.sip_legs: dict[str, Endpoint] = {}             # key -> leg
+        self.legs: dict[str, Endpoint] = {}                 # key -> SIP / PoC / console leg
         self.calls: dict[int, Call] = {}                    # call_id -> call
         self.tg_calls: dict[int, int] = {}                  # tg -> call_id
         self.transport: asyncio.DatagramTransport | None = None
@@ -143,11 +156,15 @@ class CallController:
         self.aff_timeout = 1800.0
         self._parrot_ids = itertools.count(1)
 
+    @property
+    def sip_legs(self) -> dict[str, Endpoint]:   # older name, used by the SIP gateway
+        return self.legs
+
     # -------------------------------------------------------------- helpers
     def endpoint(self, key: str) -> Endpoint | None:
         if key.startswith("site:"):
             return self.sessions.get(int(key[5:]))
-        return self.sip_legs.get(key)
+        return self.legs.get(key)
 
     def endpoint_label(self, key: str) -> str:
         ep = self.endpoint(key)
@@ -362,8 +379,8 @@ class CallController:
                      and not (sess.key == exclude_key and cid == exclude_channel)]
             if chans:
                 dests[sess.key] = chans
-        for key, leg in self.sip_legs.items():
-            if getattr(leg, "tg", None) in group and key != exclude_key:
+        for key, leg in self.legs.items():
+            if key != exclude_key and leg.listens(group):
                 dests[key] = []
         return dests
 
@@ -378,6 +395,7 @@ class CallController:
             tg = db.get(TalkGroup, tg_id)
             reason = self._authorize(db, tg, unit, sysset, src.site_id)
             prio = (EMERGENCY_PRIORITY if emergency and tg and tg.emergency_enabled else (tg.priority if tg else 0))
+            prio = max(prio, int(msg.get("priority") or 0))   # dispatch consoles with call priority
             hang = tg.hang_time_ms if tg else int(sysset["default_hang_time_ms"])
 
             existing = self.floor_call(tg_id)
@@ -448,7 +466,33 @@ class CallController:
         if isinstance(ep, EdgeSession):
             await ep.send({"type": Msg.CALL_DENY, "tg": call.tg, "channel": call.src_channel,
                            "call_id": call.call_id, "reason": "preempted"})
+        elif ep is not None:
+            await ep.preempted(call)
         await self.end_call(call.call_id, "preempted")
+
+    # ------------------------------------------------------------ legs
+    async def attach_leg(self, leg: Endpoint) -> None:
+        """Register a leg (or re-check what it listens to) and join it to calls already in progress."""
+        self.legs[leg.key] = leg
+        for call in list(self.calls.values()):
+            if call.src_key == leg.key:
+                continue
+            wants = leg.listens(call.linked | {call.tg})
+            if wants and leg.key not in call.dests:
+                call.dests[leg.key] = []
+                await leg.call_started(call, [])
+            elif not wants and leg.key in call.dests:
+                del call.dests[leg.key]
+
+    async def detach_leg(self, leg: Endpoint, reason: str = "disconnected") -> None:
+        if self.legs.get(leg.key) is not leg:
+            return
+        del self.legs[leg.key]
+        for call in list(self.calls.values()):
+            if call.src_key == leg.key:
+                await self.end_call(call.call_id, f"source_{reason}")
+            else:
+                call.dests.pop(leg.key, None)
 
     async def source_ended(self, call_id: int, src_key: str) -> None:
         call = self.calls.get(call_id)
@@ -479,7 +523,7 @@ class CallController:
                 except Exception as e:
                     log.debug("call_end to %s failed: %s", key, e)
         src = self.endpoint(call.src_key)
-        if isinstance(src, EdgeSession) and reason not in ("source_disconnected",):
+        if src is not None and call.src_key not in call.dests and reason not in ("source_disconnected",):
             try:
                 await src.call_ended(call, reason)
             except Exception:

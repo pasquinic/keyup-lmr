@@ -333,6 +333,46 @@ pages.channels = resourcePage({
   fields: CHANNEL_FIELDS,
 });
 
+async function pocActivation(unit) {
+  if (!confirm(`Issue a PoC activation code for radio ${unit}? This enables PoC for the radio ID; the code works once and expires in 24 hours.`)) return;
+  try {
+    const a = await api(`/subscribers/${unit}/poc/activation`, {method: "POST"});
+    const m = $("#modal"), f = $("#modalForm");
+    f.innerHTML = `<h2>Activate a phone as radio ${esc(a.unit)} · ${esc(a.alias)}</h2>
+      <div class="qrwrap"><div class="qr">${a.qr_svg}</div>
+      <dl class="kv"><dt>Server</dt><dd>${esc(a.server)}</dd><dt>Radio ID</dt><dd>${esc(a.unit)}</dd>
+      <dt>Code</dt><dd style="font-size:20px;letter-spacing:3px">${esc(a.code)}</dd><dt>Expires</dt><dd>${new Date(a.expires_at).toLocaleString()}</dd></dl></div>
+      <p class="muted">In the KeyUp app tap <b>Scan activation QR code</b>, or enter the server, radio ID and code. The phone then follows the same rules as this radio ID: inhibit, permitted talkgroups, zones and busy / priority rules.</p>
+      <div class="formfoot"><button class="btn primary" value="cancel">Done</button></div>`;
+    m.showModal(); f.onsubmit = () => { m.close(); route(); };
+  } catch (err) { toast(err.message, true); }
+}
+
+pages.poc = async el => {
+  const [devs, st] = await Promise.all([api("/poc/devices"), api("/poc/status")]);
+  const subs = Object.fromEntries((await api("/subscribers")).map(s => [s.id, s]));
+  const em = Object.entries(st.emergencies || {});
+  el.innerHTML = `${em.length ? `<div class="card" style="border-color:var(--emerg);margin-bottom:16px"><h3 style="color:var(--emerg)">Active emergencies</h3>
+      ${em.map(([tg, e]) => `<div>TG ${esc(tg)} · unit ${esc(e.src)} (${esc(subs[e.src]?.alias || "")}) since ${new Date(e.ts * 1000).toLocaleTimeString()}</div>`).join("")}</div>` : ""}
+  <div class="grid kpis">${kpi(st.sessions.length, "Phones online")}${kpi(devs.filter(d => !d.revoked).length, "Activated phones")}${kpi(st.sessions.filter(s => s.talking).length, "Transmitting")}</div>
+  <div class="card" style="margin-top:16px"><h3>Online now</h3><div class="tablewrap"><table><thead><tr><th>Radio ID</th><th>Alias</th><th>Platform</th><th>Selected TG</th><th>Scan</th><th>Status</th><th>Connected</th></tr></thead><tbody>
+  ${st.sessions.map(s => `<tr><td class="mono">${esc(s.unit)}</td><td>${esc(s.alias)}</td><td>${esc(s.platform)}</td><td>${esc(s.selected ?? "—")}</td><td>${esc((s.scan || []).join(", ") || "—")}</td>
+    <td>${s.talking ? pill("TX TG " + s.talking, "denied") : pill("idle", "mode")}</td><td>${dur(s.connected_s)}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">No phones connected</td></tr>`}
+  </tbody></table></div></div>
+  <div class="card" style="margin-top:16px"><h3>Activated phones</h3><p class="muted">Issue new activations from <a href="#/subscribers">Subscriber Radios</a> → PoC QR. Revoking logs the phone out immediately.</p>
+  <div class="tablewrap"><table><thead><tr><th>Radio ID</th><th>Alias</th><th>Device</th><th>Platform / app</th><th>Activated</th><th>Last seen</th><th>State</th><th></th></tr></thead><tbody>
+  ${devs.map(d => `<tr><td class="mono">${esc(d.subscriber_id)}</td><td>${esc(subs[d.subscriber_id]?.alias || "")}</td><td>${esc(d.name)}</td><td>${esc(d.platform)} ${esc(d.app_version)}</td>
+    <td>${ago(d.created_at)}</td><td>${ago(d.last_seen)}</td><td>${d.revoked ? pill("revoked") : d.online ? pill("online") : pill("offline")}</td>
+    <td class="actions">${d.revoked ? "" : `<button class="btn sm danger" data-revoke="${d.id}">Revoke</button>`}</td></tr>`).join("") || `<tr><td colspan="8" class="empty">No phones activated yet</td></tr>`}
+  </tbody></table></div></div>`;
+  el.onclick = async e => {
+    const id = e.target.dataset.revoke;
+    if (id && confirm("Revoke this phone? It is disconnected immediately and needs a new activation.")) {
+      await api(`/poc/devices/${id}/revoke`, {method: "POST"}); toast("Revoked"); route();
+    }
+  };
+};
+
 pages.zones = async el => {
   await options("zones");
   await options("talkgroups");
@@ -368,7 +408,8 @@ pages.subscribers = async el => {
       {key: "home_site_id", label: "Assigned site"}, {label: "Talkgroups", render: r => r.talkgroup_ids.length ? esc(r.talkgroup_ids.join(", ")) : '<span class="muted">all</span>'},
       {label: "Zones", render: r => r.zone_ids.length ? esc(r.zone_ids.map(id => cache.zones?.find(z => z.id === id)?.name ?? id).join(", ")) : '<span class="muted">all</span>'},
       {label: "PoC", render: r => yes(r.poc_enabled)},
-      {label: "Last seen", render: r => r.last_seen ? `${ago(r.last_seen)} · site ${esc(r.last_site_id)} TG ${esc(r.last_tg_id ?? "")}` : "—"}, {label: "Enabled", render: r => yes(r.enabled)}],
+      {label: "Last seen", render: r => r.last_seen ? `${ago(r.last_seen)} · ${r.last_site_id ? "site " + esc(r.last_site_id) : "PoC/console"} TG ${esc(r.last_tg_id ?? "")}` : "—"}, {label: "Enabled", render: r => yes(r.enabled)}],
+    rowActions: r => `<button class="btn sm" data-poc="${esc(r.id)}">PoC QR</button> `,
     fields: [{name: "id", label: "Radio / unit ID", type: "number", required: true, readonly: true}, {name: "alias", label: "Alias", required: true},
       {name: "mode", label: "Mode", type: "select", options: MODES}, {name: "model", label: "Radio model"}, {name: "serial", label: "Serial"},
       {name: "home_site_id", label: "Assigned site / edge device", type: "select", options: "sites", nullable: true, numeric: true},
@@ -378,6 +419,10 @@ pages.subscribers = async el => {
       {name: "poc_enabled", label: "May use the PoC phone app", type: "bool"},
       {name: "notes", label: "Notes", type: "textarea", wide: true}],
   })(el);
+  el.addEventListener("click", async e => {
+    const id = e.target.dataset?.poc;
+    if (id) { e.stopPropagation(); await pocActivation(id); }
+  }, true);
   $("#importBtn", el).onclick = async () => {
     await formModal("Import subscribers (CSV)", [{name: "csv", label: "id,alias,mode,home_site_id,talkgroups(;-separated)", type: "textarea", wide: true, placeholder: "1001,Engine 1,P25P1,1,100;200"}], {}, "Import", async data => {
       const rows = data.csv.trim().split(/\r?\n/).filter(l => l && !/^id,/i.test(l)).map(l => { const [id, alias, mode, home, tgs] = l.split(",").map(s => s.trim());
@@ -519,7 +564,7 @@ pages.settings = async el => {
 };
 
 // ------------------------------------------------------------------ router
-const TITLES = {zones: "Zones", network: "Network", bandplan: "Band Plan", patches: "Talkgroup Patches", dashboard: "Dashboard", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
+const TITLES = {zones: "Zones", poc: "PoC Phones (Cellular Subscribers)", network: "Network", bandplan: "Band Plan", patches: "Talkgroup Patches", dashboard: "Dashboard", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
   subscribers: "Subscriber Radios", sip: "SIP Interconnect", calls: "Call History", settings: "System Settings"};
 async function route() {
   const page = (location.hash.slice(2).split("?")[0]) || "dashboard";

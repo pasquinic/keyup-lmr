@@ -7,6 +7,9 @@ class AppState:
     wg = None          # WireGuardManager
     transcoder = None  # TranscoderService
     sip = None         # SipGateway | None
+    poc = None         # PocGateway
+    dispatch = None    # DispatchGateway
+    recorder = None    # Recorder
     started = 0.0
 
 

@@ -12,12 +12,37 @@ export interface Talkgroup {
   mode?: string;
 }
 
+/** An ordered group of talkgroups, like a zone in a radio codeplug. */
+export interface Zone {
+  id: number;
+  name: string;
+  color?: string;
+  talkgroups: number[];
+}
+
+/** Zones from the server, or one zone with every talkgroup for servers that send none. */
+export function zonesOf(p: { talkgroups: Talkgroup[]; zones?: Zone[] }): Zone[] {
+  const ids = new Set(p.talkgroups.map((t) => t.id));
+  const zones = (p.zones ?? [])
+    .map((z) => ({ ...z, talkgroups: z.talkgroups.filter((t) => ids.has(t)) }))
+    .filter((z) => z.talkgroups.length);
+  return zones.length ? zones : [{ id: 0, name: 'All talkgroups', talkgroups: p.talkgroups.map((t) => t.id) }];
+}
+
+/** The zone to show for a talkgroup: the current zone if it holds it, else the first zone that does. */
+export function zoneFor(zones: Zone[], tg: number | null, current: number | null): number | null {
+  if (tg === null) return zones[0]?.id ?? null;
+  if (current !== null && zones.some((z) => z.id === current && z.talkgroups.includes(tg))) return current;
+  return zones.find((z) => z.talkgroups.includes(tg))?.id ?? zones[0]?.id ?? null;
+}
+
 export interface Profile {
   t: 'auth_ok' | 'profile';
   proto: number;
   unit: { id: number; alias: string };
   system: { name: string; max_call_s: number };
   talkgroups: Talkgroup[];
+  zones?: Zone[];
   selected: number | null;
   scan: number[];
   scan_on: boolean;

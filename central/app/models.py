@@ -187,6 +187,7 @@ class Channel(DictMixin, Base):
 
 class Subscriber(DictMixin, Base):
     __tablename__ = "subscribers"
+    _hidden = ("poc_activation_hash",)
     id: Mapped[int] = mapped_column(primary_key=True)  # radio / unit id
     alias: Mapped[str] = mapped_column(String(64))
     mode: Mapped[str] = mapped_column(String(8), default="P25P1")
@@ -201,6 +202,8 @@ class Subscriber(DictMixin, Base):
     last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     poc_enabled: Mapped[bool] = mapped_column(Boolean, default=False)   # may use the PoC phone app
+    poc_activation_hash: Mapped[str] = mapped_column(String(128), default="")
+    poc_activation_expires: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     talkgroups = relationship("TalkGroup", secondary=subscriber_talkgroups, lazy="selectin")
     zones = relationship("Zone", secondary=subscriber_zones, lazy="selectin")
