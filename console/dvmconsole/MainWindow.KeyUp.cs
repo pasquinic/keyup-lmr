@@ -10,7 +10,10 @@
 *
 */
 
+using System;
 using System.Diagnostics;
+using System.IO;
+using System.Threading.Tasks;
 using System.Reflection;
 using System.Windows;
 using MessageBox = System.Windows.MessageBox;
