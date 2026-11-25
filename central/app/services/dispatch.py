@@ -236,8 +236,9 @@ class DispatchGateway:
             await self._close(s)
 
     async def _close(self, s: ConsoleSession) -> None:
-        if self.sessions.pop(s.key, None) is None:
+        if self.sessions.get(s.key) is not s:
             return
+        del self.sessions[s.key]
         s.closed = True
         await self.ctl.detach_leg(s)
         bus.publish("console", action="offline", console=s.console["id"], name=s.console["name"])

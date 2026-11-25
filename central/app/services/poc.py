@@ -255,8 +255,9 @@ class PocGateway:
             await self._close(s)
 
     async def _close(self, s: PocSession) -> None:
-        if self.sessions.pop(s.key, None) is None:
+        if self.sessions.get(s.key) is not s:
             return
+        del self.sessions[s.key]
         s.closed = True
         await self.ctl.detach_leg(s)
         s.tx_tg = None

@@ -54,7 +54,11 @@ public sealed class TunnelService : ServiceBase
                                      ServerPublicKey = spec.ServerPublicKey, Endpoint = spec.Endpoint,
                                      AllowedIps = spec.AllowedIps, PersistentKeepalive = spec.PersistentKeepalive };
         if (plain.PrivateKey.Length == 0) throw new InvalidOperationException("tunnel key unreadable on this PC; activate the console again");
-        var key = JsonSerializer.Serialize(spec);
+        // Compare what the tunnel actually is, not the request file: the private key in the file is
+        // DPAPI-encrypted, which gives different bytes every time the console writes the same tunnel.
+        // Comparing those bytes rebuilt the tunnel on every reconnect and dropped the connection again.
+        var key = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(plain))));
         if (!tunnel.IsUp || key != appliedKey)
         {
             tunnel.Up(plain);

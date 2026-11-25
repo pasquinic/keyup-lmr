@@ -211,14 +211,16 @@ public sealed class MainWindow : Window
         {
             if (TunnelService.IsInstalled())
             {
-                ConnectionPlan.RequestTunnel(settings, true);
-                for (int i = 0; i < 30; i++)
+                var serial = ConnectionPlan.RequestTunnel(settings, true);
+                for (int i = 0; i < 50; i++)
                 {
+                    // Only trust a status written for this request; an older "up" may be about to change.
                     var st = TunnelHandoff.ReadStatus();
-                    if (st?.State == "up") return true;
                     if (st?.State == "error") { Log($"Tunnel: {st.Error}"); return false; }
+                    if (st?.State == "up" && st.Serial == serial) return true;
                     await Task.Delay(200);
                 }
+                Log("Tunnel: the KeyUp Tunnel service did not answer (is it running?)");
                 return false;
             }
             if (IsAdministrator())

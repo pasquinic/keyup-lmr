@@ -14,11 +14,13 @@ public static class ConnectionPlan
     }
 
     /// <summary>Hand the tunnel to the KeyUp Tunnel service (private key encrypted for this machine).</summary>
-    public static void RequestTunnel(ConsoleSettings s, bool enabled)
+    public static long RequestTunnel(ConsoleSettings s, bool enabled)
     {
         var spec = s.PlainTunnel();
         spec.PrivateKey = Secret.ProtectForMachine(spec.PrivateKey);
+        var serial = DateTime.UtcNow.Ticks;
         TunnelHandoff.WriteRequest(new TunnelHandoff.Request { Enabled = enabled && spec.IsComplete, Spec = spec,
-                                                              Serial = DateTime.UtcNow.Ticks });
+                                                              Serial = serial });
+        return serial;
     }
 }
