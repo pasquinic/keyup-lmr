@@ -20,7 +20,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 
-from lmrcommon.modes import MODE_CODEC, Codec, SystemMode
+from lmrcommon.modes import MODE_CODEC, PACKET_INTERFACES, Codec, SystemMode
 from lmrcommon.protocol import (FrameType, Flags, Msg, VoiceFrame, parse_keepalive, verify_keepalive)
 
 from ..config import settings
@@ -33,6 +33,22 @@ from .transcoder import TranscoderService
 
 log = logging.getLogger("callctl")
 EMERGENCY_PRIORITY = 100
+
+
+def carried_tg(chan: dict, group: frozenset, tg_id: int) -> int | None:
+    """The talkgroup of `group` this channel carries, or None. Radios carry their bound talkgroup;
+    packet-voice links may carry more (extra_talkgroups: comma list, or * for every talkgroup)."""
+    if chan.get("talkgroup_id") in group:
+        return chan["talkgroup_id"]
+    extra = str(chan.get("extra_talkgroups") or "").strip()
+    if extra and chan.get("interface", "radio") in PACKET_INTERFACES:
+        if extra == "*":
+            return tg_id
+        ids = {int(x) for x in extra.replace(" ", "").split(",") if x.isdigit()}
+        hit = sorted(ids & group)
+        if hit:
+            return tg_id if tg_id in hit else hit[0]
+    return None
 
 
 def get_system_settings(db) -> dict:
@@ -91,9 +107,20 @@ class EdgeSession(Endpoint):
         if self.voice_addr and self.ctl.transport:
             self.ctl.transport.sendto(frame.pack(), self.voice_addr)
 
+    def channel_codec(self, cid: int) -> Codec:
+        """Packet-voice channels take frames in their native codec; radios take the site's codec."""
+        c = self.channels.get(cid) or {}
+        if c.get("interface", "radio") in PACKET_INTERFACES:
+            return MODE_CODEC[SystemMode(c.get("mode", "P25P1"))]
+        return self.codec
+
+    def codecs_for(self, channels: list[int]) -> set[Codec]:
+        return {self.channel_codec(c) for c in channels} or {self.codec}
+
     async def call_started(self, call, channels):
         await self.send({"type": Msg.CALL_START, "call_id": call.call_id, "tg": call.tg, "src": call.src_id,
                          "src_site": call.src_site, "channels": channels, "codec": self.codec.name,
+                         "channel_codecs": {str(c): self.channel_codec(c).name for c in channels},
                          "emergency": call.emergency})
 
     async def call_ended(self, call, reason):
@@ -122,7 +149,6 @@ class Call:
     record_id: int | None = None
     seq: int = 0
     linked: frozenset = frozenset()      # talkgroups this call holds the floor on (patches)
-    dest_codecs: dict[str, set] = field(default_factory=dict)  # endpoint key -> codecs (packet channels)
     parrot: list | None = None           # recorded (codec, payload) frames to echo back
 
     def summary(self, ctl: "CallController") -> dict:
@@ -378,10 +404,15 @@ class CallController:
         for sid, sess in self.sessions.items():
             if sess.mode == "site_trunking":
                 continue
-            chans = [cid for cid, c in sess.channels.items()
-                     if c.get("talkgroup_id") in group and c.get("enabled") and c.get("role", "voice") == "voice"
-                     and self._site_allowed(c["talkgroup_id"], sid, src_site)
-                     and not (sess.key == exclude_key and cid == exclude_channel)]
+            chans = []
+            for cid, c in sess.channels.items():
+                if not c.get("enabled") or c.get("role", "voice") != "voice":
+                    continue
+                if sess.key == exclude_key and cid == exclude_channel:
+                    continue
+                tg = carried_tg(c, group, tg_id)
+                if tg is not None and self._site_allowed(tg, sid, src_site):
+                    chans.append(cid)
             if chans:
                 dests[sess.key] = chans
         for key, leg in self.legs.items():
@@ -395,6 +426,10 @@ class CallController:
         channel = msg.get("channel")
         unit = int(msg.get("src") or 0)
         emergency = bool(msg.get("emergency"))
+        try:   # packet-voice channels send in their own codec, not the site's
+            src_codec = Codec[msg["codec"]] if msg.get("codec") else src.codec
+        except KeyError:
+            src_codec = src.codec
         with session_scope() as db:
             sysset = get_system_settings(db)
             tg = db.get(TalkGroup, tg_id)
@@ -426,7 +461,7 @@ class CallController:
                 call = existing
                 old_dests = dict(call.dests)
                 call.src_key, call.src_site, call.src_channel, call.src_id = src.key, src.site_id, channel, unit
-                call.codec, call.state, call.last_voice = src.codec, "active", time.time()
+                call.codec, call.state, call.last_voice = src_codec, "active", time.time()
                 call.tg = tg_id  # a reply may come in on the other side of a patch
                 call.emergency, call.priority = call.emergency or emergency, max(call.priority, prio)
                 call.dests = dests
@@ -438,13 +473,13 @@ class CallController:
             else:
                 call = Call(call_id=next(self._ids) & 0xFFFFFFFF, tg=tg_id, priority=prio, hang_ms=hang,
                             src_key=src.key, src_site=src.site_id, src_channel=channel, src_id=unit,
-                            codec=src.codec, emergency=emergency, via_sip=src.key.startswith("sip:"), dests=dests,
+                            codec=src_codec, emergency=emergency, via_sip=src.key.startswith("sip:"), dests=dests,
                             linked=self.linked(tg_id))
                 if self.tg_rules.get(tg_id, {}).get("parrot"):
                     call.parrot = []
                 rec = CallRecord(call_id=call.call_id, talkgroup_id=tg_id, source_id=unit,
                                  source_site_id=src.site_id, source_channel_id=channel,
-                                 source_codec=src.codec.name, emergency=call.emergency, via_sip=call.via_sip,
+                                 source_codec=src_codec.name, emergency=call.emergency, via_sip=call.via_sip,
                                  dest_sites=json.dumps(list(dests)))
                 db.add(rec)
                 db.flush()
@@ -456,7 +491,7 @@ class CallController:
         self.stats["calls_granted"] += 1
 
         grant = {"type": Msg.CALL_GRANT, "call_id": call.call_id, "tg": tg_id, "channel": channel,
-                 "codec": src.codec.name, "dests": len(call.dests)}
+                 "codec": src_codec.name, "dests": len(call.dests)}
         if isinstance(src, EdgeSession):
             await src.send(grant)
         for key, chans in call.dests.items():
@@ -648,8 +683,10 @@ class CallController:
                 self.stats["frames_routed"] += 1
 
     def dest_codecs(self, call: Call, key: str, ep: Endpoint) -> set[Codec]:
-        """Codecs an endpoint gets for this call (an edge may take one stream per channel codec)."""
-        return call.dest_codecs.get(key) or {ep.codec}
+        """Codecs an endpoint gets for this call (an edge takes one stream per channel codec)."""
+        if isinstance(ep, EdgeSession):
+            return ep.codecs_for(call.dests.get(key, []))
+        return {ep.codec}
 
     def on_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
         try:

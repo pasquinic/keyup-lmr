@@ -328,7 +328,9 @@ pages.channels = resourcePage({
     {label: "RX / TX MHz", render: r => `<span class="mono">${mhz(r.rx_mhz)} / ${mhz(r.tx_mhz)}</span>`}, {label: "Access", render: r => esc(r.mode.startsWith("P25") ? "NAC " + r.nac : r.mode === "DMR" ? `CC${r.color_code} TS${r.timeslot}` : r.mode === "NXDN" ? "RAN " + r.ran : r.ctcss_hz ? r.ctcss_hz + " Hz" : "CSQ")},
     {key: "talkgroup_id", label: "TG"}, {key: "codec", label: "Codec"},
     {label: "Band plan", render: r => r.identity !== null && r.identity !== undefined ? `<span class="mono">id ${r.identity} · ch ${r.channel_no}</span>` : '<span class="muted">—</span>'},
-    {label: "PTT / COR", render: r => `<span class="mono">${r.signaling === "serial" ? `RTS/CTS ${esc(r.serial_port)}` : `GPIO ${r.ptt_gpio} / ${r.cor_gpio}`}</span>`},
+    {label: "Interface", render: r => r.interface && r.interface !== "radio"
+      ? `${pill({dfsi: "DFSI", ipsc: "IPSC", capplus: "Cap+"}[r.interface] || r.interface, "mode")} <span class="mono">udp/${esc(r.packet_config?.local_port ?? "?")}${r.packet_config?.remote_host ? " → " + esc(r.packet_config.remote_host) + ":" + esc(r.packet_config.remote_port ?? "") : ""}</span>${r.extra_talkgroups ? ` <span class="muted">+TG ${esc(r.extra_talkgroups)}</span>` : ""}`
+      : `<span class="mono">${r.signaling === "serial" ? `RTS/CTS ${esc(r.serial_port)}` : `GPIO ${r.ptt_gpio} / ${r.cor_gpio}`}</span>`},
     {label: "Checks", render: r => r.warnings.length ? `<div class="warnlist">${r.warnings.map(esc).join("<br>")}</div>` : pill("ok", "yes")}],
   fields: CHANNEL_FIELDS,
 });
@@ -518,9 +520,11 @@ pages.network = async el => {
   ${n.sites.map(s => `<div class="card" style="margin-top:16px"><h3>${pill(s.mode === "site_trunking" ? "site_trunking" : "online")} Site ${esc(s.site_id)} · ${esc(s.label)}</h3>
     <dl class="kv"><dt>Edge</dt><dd>${esc(s.remote_ip)} · heartbeat ${s.heartbeat_age_s}s ago · v${esc(s.telemetry.version || "?")}${s.telemetry.cpu_temp_c ? ` · ${s.telemetry.cpu_temp_c}°C` : ""}</dd>
     <dt>Voice path</dt><dd>${s.voice_bound ? "bound" : "not bound"} · network codec ${esc(s.codec)} · vocoders ${esc(s.vocoders.join("/"))}</dd></dl>
-    <table style="margin-top:8px"><thead><tr><th>Port</th><th>Channel</th><th>Mode</th><th>TG</th><th>Carrier (COR)</th><th>Transmit (PTT)</th></tr></thead><tbody>
+    <table style="margin-top:8px"><thead><tr><th>Port</th><th>Channel</th><th>Mode</th><th>TG</th><th>Link</th><th>Receiving</th><th>Transmitting</th></tr></thead><tbody>
     ${s.channels.map(c => `<tr><td>${esc(c.slot ?? "")}</td><td>${esc(c.name)}</td><td>${pill(c.mode || "", "mode")}</td><td>${esc(c.tg ?? "—")}</td>
-      <td>${c.cor ? pill("receiving", "online") : '<span class="muted">idle</span>'}</td><td>${c.ptt ? pill("keyed", "denied") : '<span class="muted">idle</span>'}</td></tr>`).join("") || `<tr><td colspan="6" class="empty">No channels reported</td></tr>`}
+      <td>${c.interface ? `${pill(c.link_up ? "up" : "down", c.link_up ? "online" : "denied")} <span class="muted">${esc({dfsi: "DFSI " + (c.remote || ""), ipsc: "IPSC " + c.role + (c.peers?.length ? " · peers " + c.peers.join(", ") : ""), capplus: "Cap+ → " + (c.master || "")}[c.interface] || "")}</span>` : '<span class="muted">radio</span>'}</td>
+      <td>${c.cor ? pill("receiving", "online") : '<span class="muted">idle</span>'}${c.last_call_in ? ` <span class="muted">last TG ${esc(c.last_call_in.tg)} · ${esc(c.last_call_in.src)}</span>` : ""}</td>
+      <td>${c.ptt ? pill("keyed", "denied") : '<span class="muted">idle</span>'}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">No channels reported</td></tr>`}
     </tbody></table></div>`).join("") || `<div class="card empty" style="margin-top:16px">No edge devices connected</div>`}
   <div class="grid two" style="margin-top:16px">
     <div class="card"><h3>Affiliations</h3><div class="tablewrap"><table><thead><tr><th>Radio</th><th>Site</th><th>TG</th><th>Heard</th></tr></thead><tbody>

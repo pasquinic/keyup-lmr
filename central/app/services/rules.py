@@ -92,6 +92,29 @@ class Affiliations:
 
 
 # ====================================================================== configuration checks
+def add_packet_checks(c: dict, add, scope: str) -> None:
+    """Packet-voice links: the mode must match the interface, and the link needs its addresses."""
+    from lmrcommon.modes import INTERFACE_MODES
+    iface = c.get("interface")
+    pc = c.get("packet_config") or {}
+    if c.get("mode") not in INTERFACE_MODES.get(iface, ()):
+        add(scope, f"{iface.upper()} links carry {' / '.join(INTERFACE_MODES.get(iface, ()))}; mode is {c.get('mode')}")
+    if not c.get("talkgroup_id") and not str(c.get("extra_talkgroups") or "").strip():
+        add(scope, "packet link carries no talkgroups (set the bound talkgroup or 'more talkgroups')")
+    if not pc.get("local_port"):
+        add(scope, "set the local UDP port the edge listens on")
+    if iface == "dfsi" and not pc.get("remote_host"):
+        add(scope, "DFSI needs the fixed station's address (remote host / port)")
+    if iface in ("ipsc", "capplus"):
+        if not pc.get("peer_id"):
+            add(scope, "set KeyUp's IPSC peer (radio) ID")
+        if (iface == "capplus" or pc.get("role") == "peer") and not pc.get("remote_host"):
+            add(scope, "joining as a peer needs the master repeater's address (remote host / port)")
+        key = str(pc.get("auth_key") or "")
+        if key and (len(key) > 40 or any(ch not in "0123456789abcdefABCDEF" for ch in key)):
+            add(scope, "authentication key must be up to 40 hex digits")
+
+
 def config_checks(sites: list[dict], channels: list[dict], tgs: list[dict], patches: list[dict],
                   plan: list[dict], devices: list[dict]) -> list[dict]:
     """Human-readable problems an operator should fix: [{scope, message}]."""
@@ -106,6 +129,10 @@ def config_checks(sites: list[dict], channels: list[dict], tgs: list[dict], patc
         scope = f"channel {c['name']} (site {c['site_id']})"
         if not c.get("enabled"):
             continue
+        iface = c.get("interface", "radio")
+        if iface != "radio":
+            add_packet_checks(c, add, scope)
+            continue
         if c.get("role", "voice") == "voice" and not c.get("talkgroup_id"):
             add(scope, "voice channel has no talkgroup bound; it will never be keyed")
         if plan:
@@ -115,7 +142,7 @@ def config_checks(sites: list[dict], channels: list[dict], tgs: list[dict], patc
             add(scope, "serial signalling selected but no serial port set")
     taken: dict[tuple, str] = {}
     for c in channels:
-        if c.get("enabled") and c.get("signaling", "gpio") == "gpio":
+        if c.get("enabled") and c.get("signaling", "gpio") == "gpio" and c.get("interface", "radio") == "radio":
             for pin in (c.get("ptt_gpio"), c.get("cor_gpio")):
                 k = (c["site_id"], pin)
                 if k in taken and taken[k] != c["name"]:

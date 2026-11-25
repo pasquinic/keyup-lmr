@@ -201,6 +201,13 @@ def frequency_plan(db: Session = Depends(get_db)):
     rows = []
     for c in chans:
         warn = []
+        if c.interface != "radio":   # packet-voice link: no RF of ours to plan; show its link checks instead
+            probs: list[str] = []
+            rules.add_packet_checks(c.to_dict(), lambda _scope, m: probs.append(m), "")
+            rows.append({**c.to_dict(), "site_name": sites.get(c.site_id, "?"),
+                         "codec": MODE_CODEC[SystemMode(c.mode)].name, "warnings": probs,
+                         "identity": None, "channel_no": None})
+            continue
         if c.tx_mhz and tx[round(c.tx_mhz, 5)] > 1:
             warn.append("TX frequency reused at another site/slot (check spacing & simulcast intent)")
         if c.rx_mhz and c.tx_mhz and abs(c.rx_mhz - c.tx_mhz) < 0.0001 and c.mode != "ANALOG":

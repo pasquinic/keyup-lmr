@@ -12,17 +12,19 @@ from urllib.parse import urlparse
 import websockets
 
 from lmrcommon import audio, morse
-from lmrcommon.modes import Codec
+from lmrcommon.modes import PACKET_INTERFACES, Codec
 from lmrcommon.protocol import FrameType, Msg, VoiceFrame, make_keepalive, Flags
 from lmrcommon.vocoder import VocoderPool, VocoderUnavailable
 
 from . import __version__
 from .notifier import Notifier
+from .packet import make_packet_channel
 from .radio import make_channel
 from .state import State
 
 log = logging.getLogger("agent")
-HW_KEYS = ("audio_device", "ptt_gpio", "cor_gpio", "cor_active_low", "signaling", "serial_port", "cor_invert")
+HW_KEYS = ("audio_device", "ptt_gpio", "cor_gpio", "cor_active_low", "signaling", "serial_port", "cor_invert",
+           "interface", "packet_config", "mode", "timeslot")
 
 
 @dataclass
@@ -30,7 +32,8 @@ class ChanState:
     rx: str = "idle"        # idle|requesting|granted|ended_pending|denied|blocked|local
     rx_call: int = 0
     unit: int = 0
-    buffer: list = field(default_factory=list)
+    buffer: list = field(default_factory=list)   # ("frame", pcm) or ("pframe", codec frame) before the grant
+    tg: int = 0                                    # talkgroup of the current call (packet links: per call)
     uplink: asyncio.Queue | None = None
     local: dict | None = None
     deny_reason: str = ""
@@ -116,7 +119,10 @@ class EdgeAgent:
             if cid in self.radios:
                 self.radios[cid].update_config(c)
                 continue
-            r = make_channel(self.cfg["radio_backend"], c, self.loop, self.on_cor, self.on_audio)
+            if c.get("interface", "radio") in PACKET_INTERFACES:
+                r = make_packet_channel(c, self.loop, self.on_cor, self.on_audio, self.on_packet_frame, self.pool)
+            else:
+                r = make_channel(self.cfg["radio_backend"], c, self.loop, self.on_cor, self.on_audio)
             try:
                 await r.start()
             except Exception as e:
@@ -139,16 +145,21 @@ class EdgeAgent:
             if radio.ptt:
                 cs.rx = "blocked"  # our own transmission / half-duplex
                 return
-            tg = radio.cfg.get("talkgroup_id")
+            packet = getattr(radio, "packet", False)
+            tg = radio.rx_tg if packet else radio.cfg.get("talkgroup_id")
             if not tg:
                 return
             cs.unit = unit or radio.cfg.get("default_unit_id", 0)
+            cs.tg = tg
             if self.mode == "site_trunking" or not self.connected:
                 self._local_start(cid, tg, cs.unit)
                 return
             cs.rx, cs.buffer = "requesting", []
-            self._task(self.send({"type": Msg.CALL_REQUEST, "channel": cid, "tg": tg, "src": cs.unit,
-                                  "emergency": False}))
+            req = {"type": Msg.CALL_REQUEST, "channel": cid, "tg": tg, "src": cs.unit,
+                   "emergency": bool(packet and radio.rx_emergency)}
+            if packet:
+                req["codec"] = radio.codec.name
+            self._task(self.send(req))
         else:
             if cs.rx == "granted":
                 cs.uplink.put_nowait(("end", cs.rx_call, None))
@@ -169,7 +180,7 @@ class EdgeAgent:
         if not cs:
             return
         if cs.rx == "requesting":
-            cs.buffer.append(pcm)
+            cs.buffer.append(("frame", pcm))
             del cs.buffer[:-25]
         elif cs.rx == "granted":
             cs.uplink.put_nowait(("frame", cs.rx_call, pcm))
@@ -179,24 +190,68 @@ class EdgeAgent:
                 if r:
                     r.write_audio(pcm)
 
+    def on_packet_frame(self, cid: int, payload: bytes) -> None:
+        """A voice frame in the link's native codec from a packet-voice channel."""
+        cs, src = self.chan.get(cid), self.radios.get(cid)
+        if not cs or not src:
+            return
+        if cs.rx == "requesting":
+            cs.buffer.append(("pframe", payload))
+            del cs.buffer[:-25]
+        elif cs.rx == "granted":
+            cs.uplink.put_nowait(("pframe", cs.rx_call, payload))
+        elif cs.rx == "local" and cs.local:
+            pcm_dests = []
+            for d in cs.local["dests"]:
+                r = self.radios.get(d)
+                if r is None:
+                    continue
+                if getattr(r, "packet", False) and r.codec == src.codec:
+                    r.write_frame(payload)
+                else:
+                    pcm_dests.append(r)
+            if pcm_dests and self.pool.available(src.codec):
+                self._task(self._local_decode(cs, src.codec, payload, pcm_dests))
+
+    async def _local_decode(self, cs: ChanState, codec: Codec, payload: bytes, dests: list) -> None:
+        """Site trunking: a packet-link call heard on radios needs the edge's vocoder."""
+        try:
+            dec = cs.local.setdefault("decoder", None) or self.pool.acquire(codec)
+            cs.local["decoder"] = dec
+            pcm = await asyncio.to_thread(dec.decode, payload)
+        except Exception:
+            return
+        for r in dests:
+            r.write_audio(pcm)
+
     async def _uplink_worker(self, cid: int) -> None:
         """Encode + send this channel's RX audio in order (DVSI calls run off-loop)."""
         cs = self.chan[cid]
         enc, enc_call, seq = None, 0, 0
+        codec = self.network_codec
         while True:
             kind, call_id, pcm = await cs.uplink.get()
             radio = self.radios.get(cid)
-            tg = radio.cfg.get("talkgroup_id", 0) if radio else 0
+            tg = cs.tg or (radio.cfg.get("talkgroup_id", 0) if radio else 0)
             if kind == "start":
                 enc_call, seq = call_id, 0
                 if enc:
                     enc.release()
-                try:
-                    enc = self.pool.acquire(self.network_codec)
-                except VocoderUnavailable as e:
-                    log.error("no vocoder for uplink: %s", e)
                     enc = None
-                self._send_voice(VoiceFrame(FrameType.VOICE_START, self.network_codec, self.site_id, call_id, tg, cs.unit, seq))
+                if getattr(radio, "packet", False):
+                    codec = radio.codec      # frames are already in the link's codec
+                else:
+                    codec = self.network_codec
+                    try:
+                        enc = self.pool.acquire(codec)
+                    except VocoderUnavailable as e:
+                        log.error("no vocoder for uplink: %s", e)
+                        enc = None
+                self._send_voice(VoiceFrame(FrameType.VOICE_START, codec, self.site_id, call_id, tg, cs.unit, seq))
+            elif kind == "pframe" and call_id == enc_call:
+                seq += 1
+                self._send_voice(VoiceFrame(FrameType.VOICE, codec, self.site_id, call_id, tg, cs.unit, seq, 0, pcm))
+                self.stats["frames_tx"] += 1
             elif kind == "frame" and enc and call_id == enc_call:
                 seq += 1
                 try:
@@ -204,10 +259,10 @@ class EdgeAgent:
                 except Exception as e:
                     log.error("encode error: %s", e)
                     continue
-                self._send_voice(VoiceFrame(FrameType.VOICE, self.network_codec, self.site_id, call_id, tg, cs.unit, seq, 0, data))
+                self._send_voice(VoiceFrame(FrameType.VOICE, codec, self.site_id, call_id, tg, cs.unit, seq, 0, data))
                 self.stats["frames_tx"] += 1
             elif kind == "end" and call_id == enc_call:
-                self._send_voice(VoiceFrame(FrameType.VOICE_END, self.network_codec, self.site_id, call_id, tg, cs.unit, seq + 1))
+                self._send_voice(VoiceFrame(FrameType.VOICE_END, codec, self.site_id, call_id, tg, cs.unit, seq + 1))
                 if enc:
                     enc.release()
                 enc, enc_call = None, 0
@@ -226,8 +281,8 @@ class EdgeAgent:
                 cs.rx, cs.rx_call = "granted", msg["call_id"]
                 self.stats["calls_tx"] += 1
                 cs.uplink.put_nowait(("start", cs.rx_call, None))
-                for f in cs.buffer:
-                    cs.uplink.put_nowait(("frame", cs.rx_call, f))
+                for kind, f in cs.buffer:
+                    cs.uplink.put_nowait((kind, cs.rx_call, f))
                 cs.buffer = []
             elif cs.rx == "ended_pending":
                 cs.rx = "idle"
@@ -262,9 +317,20 @@ class EdgeAgent:
         if call is None:
             q: asyncio.Queue = asyncio.Queue(maxsize=200)
             call = self.inbound[cid] = {"channels": set(), "q": q, "codec": Codec[msg.get("codec", "ULAW")],
-                                        "task": None, "tg": msg.get("tg"), "src": msg.get("src")}
+                                        "task": None, "tg": msg.get("tg"), "src": msg.get("src"), "chan_codecs": {}}
             call["task"] = self._task(self._downlink_worker(cid))
             self.stats["calls_rx"] += 1
+        call["tg"], call["src"] = msg.get("tg", call["tg"]), msg.get("src", call["src"])
+        for c, name in (msg.get("channel_codecs") or {}).items():
+            try:
+                call["chan_codecs"][int(c)] = Codec[name]
+            except (KeyError, ValueError):
+                pass
+        for c in want:
+            r = self.radios[c]
+            if getattr(r, "packet", False):
+                tg = call["tg"] if r.carries(call["tg"] or 0) else r.cfg.get("talkgroup_id")
+                r.tx_info = {"tg": tg, "src": call["src"], "emergency": bool(msg.get("emergency"))}
         for c in call["channels"] - want:
             self.radios[c].unkey()
         for c in want - call["channels"]:
@@ -288,8 +354,11 @@ class EdgeAgent:
                 cs.rx = "blocked"  # central ended our call (max time etc.) -- wait for COR drop
 
     async def _downlink_worker(self, call_id: int) -> None:
+        """Play a network call: packet links take frames in their own codec untouched; radios (and
+        packet links fed another codec) get PCM, decoded once per frame."""
         call = self.inbound[call_id]
-        dec = None
+        decs: dict[Codec, object] = {}
+        failed: set[Codec] = set()
         try:
             while True:
                 frame = await call["q"].get()
@@ -297,21 +366,34 @@ class EdgeAgent:
                     break
                 if not frame.payload:
                     continue
-                if dec is None or dec.codec != frame.codec:
-                    if dec:
-                        dec.release()
-                    dec = self.pool.acquire(frame.codec)
-                pcm = dec.decode(frame.payload) if dec.name.startswith("software") else \
-                    await asyncio.to_thread(dec.decode, frame.payload)
+                pcm_targets = []
                 for c in call["channels"]:
                     r = self.radios.get(c)
-                    if r:
+                    if r is None:
+                        continue
+                    want = call["chan_codecs"].get(c, call["codec"])
+                    if frame.codec != want and len(set(call["chan_codecs"].values()) | {call["codec"]}) > 1:
+                        continue   # this stream is for the site's other channels
+                    if getattr(r, "packet", False) and frame.codec == r.codec:
+                        r.write_frame(frame.payload)
+                    else:
+                        pcm_targets.append(r)
+                if pcm_targets and frame.codec not in failed:
+                    dec = decs.get(frame.codec)
+                    try:
+                        if dec is None:
+                            dec = decs[frame.codec] = self.pool.acquire(frame.codec)
+                        pcm = dec.decode(frame.payload) if dec.name.startswith("software") else \
+                            await asyncio.to_thread(dec.decode, frame.payload)
+                    except VocoderUnavailable as e:
+                        log.error("call %s: cannot decode %s: %s", call_id, frame.codec.name, e)
+                        failed.add(frame.codec)
+                        continue
+                    for r in pcm_targets:
                         r.write_audio(pcm)
                 self.stats["frames_rx"] += 1
-        except VocoderUnavailable as e:
-            log.error("call %s: cannot decode: %s", call_id, e)
         finally:
-            if dec:
+            for dec in decs.values():
                 dec.release()
 
     def on_voice(self, frame: VoiceFrame) -> None:
@@ -327,6 +409,8 @@ class EdgeAgent:
         for c in call["channels"]:  # (re-)key on voice, e.g. next talker inside hang time
             r = self.radios.get(c)
             if r and not r.ptt and not r.cor:
+                if getattr(r, "packet", False):
+                    r.tx_info = {**r.tx_info, "src": frame.src}
                 r.key()
         try:
             call["q"].put_nowait(frame)
@@ -360,7 +444,10 @@ class EdgeAgent:
         dests = []
         if self.cfg["site_trunking"].get("local_repeat", True):
             for oid, r in self.radios.items():
-                if oid != cid and r.cfg.get("talkgroup_id") == tg and not r.cor:
+                carries = r.carries(tg) if getattr(r, "packet", False) else r.cfg.get("talkgroup_id") == tg
+                if oid != cid and carries and not r.cor:
+                    if getattr(r, "packet", False):
+                        r.tx_info = {"tg": tg, "src": unit, "emergency": False}
                     r.key()
                     dests.append(oid)
         cs.rx = "local"
@@ -374,6 +461,8 @@ class EdgeAgent:
         call, cs.local, cs.rx = cs.local, None, "idle"
         if not call:
             return
+        if call.get("decoder"):
+            call.pop("decoder").release()
         for d in call["dests"]:
             if d in self.radios:
                 self.radios[d].unkey()
@@ -417,6 +506,8 @@ class EdgeAgent:
         interval = self.setting("cw_id_interval_s", 600)
         t = time.time()
         for cid, r in list(self.radios.items()):
+            if getattr(r, "packet", False):
+                continue   # no CW on packet links (the equipment identifies itself)
             if r.ptt and not r.cw_keyed:
                 self.cw_pending[cid] = True
             if not self.cw_pending.get(cid) or r.ptt or r.cor:

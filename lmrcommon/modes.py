@@ -65,3 +65,9 @@ def codec_for_mode(mode: str) -> Codec:
 
 def needs_transcode(src: Codec, dst: Codec) -> bool:
     return Codec(src) != Codec(dst)
+
+
+# Channel interfaces that carry packetized digital voice (codec frames, no audio): the channel's mode
+# decides its native codec (DFSI: P25 Phase I -> IMBE; IP Site Connect / Capacity Plus: DMR -> AMBE+2).
+PACKET_INTERFACES = ("dfsi", "ipsc", "capplus")
+INTERFACE_MODES = {"dfsi": ("P25P1",), "ipsc": ("DMR",), "capplus": ("DMR",)}
