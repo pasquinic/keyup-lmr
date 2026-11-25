@@ -117,7 +117,7 @@ internal sealed class WaveBuffers : IDisposable
         {
             data[i] = Marshal.AllocHGlobal(Bytes);
             Headers[i] = Marshal.AllocHGlobal(HeaderSize);
-            Marshal.StructureToPtr(new WinMm.WaveHdr { lpData = data[i], dwBufferLength = Bytes }, Headers[i], false);
+            Marshal.StructureToPtr(new WinMm.WaveHdr { lpData = data[i], dwBufferLength = (uint)Bytes }, Headers[i], false);
         }
     }
 
