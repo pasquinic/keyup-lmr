@@ -1,0 +1,1 @@
+This is a copy of the Pavel Yazev vocoder library that is included [as part of dvmhost](https://github.com/DVMProject/dvmhost/tree/master/src/vocoder). It has been broken out as a standalone cmake combilable shared library for use in other projects.

@@ -214,6 +214,42 @@ class PocDevice(DictMixin, Base):
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class DispatchConsole(DictMixin, Base):
+    """A PC running the KeyUp Dispatch Console (dvmconsole fork): an FNE peer that transmits as a radio ID."""
+    __tablename__ = "dispatch_consoles"
+    _hidden = ("token_hash", "activation_hash")
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(64))
+    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id", ondelete="CASCADE"), index=True)
+    peer_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)   # blank = 9300000 + id
+    talkgroup_ids: Mapped[str] = mapped_column(String(1024), default="")  # comma list; blank = all the radio may use
+    can_inhibit: Mapped[bool] = mapped_column(Boolean, default=True)      # may send inhibit / uninhibit
+    call_priority: Mapped[bool] = mapped_column(Boolean, default=True)    # FNE call priority over radios
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    wg_public_key: Mapped[str] = mapped_column(String(64), default="")
+    wg_ip: Mapped[str] = mapped_column(String(45), default="")
+    token_hash: Mapped[str] = mapped_column(String(64), default="")
+    activation_hash: Mapped[str] = mapped_column(String(128), default="")
+    activation_expires: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    activated_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    last_sync: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    notes: Mapped[str] = mapped_column(Text, default="")
+
+    @property
+    def fne_peer_id(self) -> int:
+        return self.peer_id or 9300000 + self.id
+
+    def tg_list(self) -> list[int]:
+        return [int(x) for x in (self.talkgroup_ids or "").split(",") if x.strip().isdigit()]
+
+    def to_dict(self):
+        d = super().to_dict()
+        d["fne_peer_id"] = self.fne_peer_id
+        d["activated"] = bool(self.token_hash)
+        d["talkgroup_ids"] = self.tg_list()
+        return d
+
+
 class IdenEntry(DictMixin, Base):
     """Band plan identity (DVM iden_table.dat): maps channel numbers to frequencies."""
     __tablename__ = "iden_table"

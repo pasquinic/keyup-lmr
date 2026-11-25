@@ -6,6 +6,12 @@ KeyUp is free software, licensed under the GNU General Public License version 2
 dvm/dvmhost/, which is GPL-2.0 and remains under the copyright of its authors
 (see the headers in each source file and dvm/FORK.md).
 
+The Windows dispatch console in console/ is a fork of DVMProject's dvmconsole and
+fnecore, licensed under the GNU Affero General Public License version 3
+(console/LICENSE), with dvmvocoder (GPL-2.0) in console/dvmvocoder/. It is a
+separate program that talks to KeyUp and the FNE over the network; see
+console/FORK.md.
+
 DVMProject's usage guidelines (dvm/dvmhost/usage_guidelines.md) state that the
 software is not designed, tested, certified or supported for public safety or
 life safety use. KeyUp follows that: it is for personal, non-commercial use, and

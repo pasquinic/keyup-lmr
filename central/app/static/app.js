@@ -226,6 +226,7 @@ function connectLive() {
     else if (e.event === "device") logEvent(`DEVICE ${e.device_id} ${e.status}`, e.ts);
     else if (e.event === "calls_imported") logEvent(`Imported ${e.count} site-trunking call records from site ${e.site_id}`, e.ts);
     else if (e.event === "sip_leg") logEvent(`SIP ${e.caller} ${e.action} on TG ${e.tg}`, e.ts);
+    else if (e.event === "console") logEvent(`Console ${e.name} ${e.action}${e.machine ? " (" + e.machine + ")" : ""}`, e.ts);
     else if (e.event === "poc") logEvent(`PoC ${e.unit} ${e.alias || ""} ${e.action}${e.platform ? " (" + e.platform + ")" : ""}`, e.ts);
     else if (e.event === "emergency") { logEvent(`${e.on ? "⚠ EMERGENCY" : "Emergency cleared"} TG ${e.tg} unit ${e.unit} ${e.alias || ""}`, e.ts); showAlarm(e); }
   };
@@ -546,6 +547,57 @@ pages.poc = async el => {
   };
 };
 
+pages.consoles = async el => {
+  await resourcePage({
+    path: "consoles", title: "Dispatch Console",
+    columns: [{key: "id", label: "#"}, {key: "name", label: "Name"},
+      {label: "Radio ID", render: r => `<span class="mono">${esc(r.subscriber_id)}</span> ${esc(r.subscriber_alias)}`},
+      {label: "FNE peer", render: r => `<span class="mono">${esc(r.fne_peer_id)}</span>`},
+      {label: "Talkgroups", render: r => r.talkgroups.length ? esc(r.talkgroups.join(", ")) : '<span class="muted">none permitted</span>'},
+      {label: "Rights", render: r => [r.can_inhibit && "inhibit", r.call_priority && "priority"].filter(Boolean).join(" · ") || '<span class="muted">—</span>'},
+      {label: "Tunnel", render: r => r.wg_ip ? `<span class="mono">${esc(r.wg_ip)}</span>${r.wg?.latest_handshake ? " · " + ago(new Date(r.wg.latest_handshake * 1000).toISOString()) : ""}` : '<span class="muted">—</span>'},
+      {label: "Status", render: r => !r.enabled ? pill("disabled") : r.online ? pill("online") : r.activated ? pill("offline") : pill("not activated", "mode")},
+      {label: "Last sync", render: r => r.last_sync ? ago(r.last_sync) : "—"}],
+    rowActions: r => `<button class="btn sm" data-cact="${esc(r.id)}">Activate</button> ${r.activated ? `<button class="btn sm danger" data-crev="${esc(r.id)}">Revoke</button> ` : ""}`,
+    fields: [{name: "name", label: "Name (shown on the FNE)", required: true, placeholder: "Dispatch 1"},
+      {name: "subscriber_id", label: "Transmits as radio ID", type: "select", options: "subscribers", numeric: true},
+      {name: "talkgroup_ids", label: "Talkgroups on the console (none = every talkgroup the radio ID may use)", type: "multi", options: "talkgroups", wide: true},
+      {name: "can_inhibit", label: "May inhibit / uninhibit radios", type: "bool", default: true},
+      {name: "call_priority", label: "Call priority over radios", type: "bool", default: true},
+      {name: "enabled", label: "Enabled", type: "bool", default: true},
+      {name: "peer_id", label: "FNE peer ID (blank = 9300000 + console #)", type: "number", nullable: true},
+      {name: "notes", label: "Notes", type: "textarea", wide: true}],
+  })(el);
+  el.insertAdjacentHTML("afterbegin", `<div class="card" style="margin-bottom:16px"><h3>KeyUp Dispatch Console for Windows</h3>
+    <p class="muted">Each console is a PC on the FNE as its own peer, transmitting as the chosen radio ID under the same talkgroup rules as a radio.
+    Install the console and <a href="https://www.wireguard.com/install/" target="_blank" rel="noopener">WireGuard for Windows</a> on the PC, press <b>Activate</b> here,
+    then in the console choose <b>File → Connect to KeyUp server</b> and enter the server address and code. Talkgroup and alias changes reach the console on its next start or <b>File → Sync with KeyUp</b>.</p></div>`);
+  el.addEventListener("click", async e => {
+    const act = e.target.dataset?.cact, rev = e.target.dataset?.crev;
+    if (act) { e.stopPropagation(); await consoleActivation(act); }
+    if (rev) {
+      e.stopPropagation();
+      if (!confirm("Revoke this console? Its tunnel and login stop working immediately and it is disabled; activate it again to reconnect.")) return;
+      try { await api(`/consoles/${rev}/revoke`, {method: "POST"}); toast("Revoked"); route(); } catch (err) { toast(err.message, true); }
+    }
+  }, true);
+};
+
+async function consoleActivation(id) {
+  try {
+    const a = await api(`/consoles/${id}/activation`, {method: "POST"});
+    const m = $("#modal"), f = $("#modalForm");
+    f.innerHTML = `<h2>Activate console ${esc(a.name)}</h2>
+      <dl class="kv"><dt>Server</dt><dd class="mono">${esc(a.server)}</dd>
+      <dt>Code</dt><dd style="font-size:22px;letter-spacing:3px" class="mono">${esc(a.code)}</dd><dt>Expires</dt><dd>${new Date(a.expires_at).toLocaleString()}</dd></dl>
+      <ol class="muted"><li>In the KeyUp Dispatch Console choose <b>File → Connect to KeyUp server…</b> and enter the server and code.</li>
+      <li>The console saves a WireGuard tunnel file and opens its folder: in WireGuard for Windows choose <b>Import tunnel(s) from file</b>, pick <span class="mono">keyup-wireguard.conf</span> and <b>Activate</b>.</li>
+      <li>The console connects to the FNE through the tunnel. The code works once; activating again replaces the tunnel.</li></ol>
+      <div class="formfoot"><button class="btn primary" value="cancel">Done</button></div>`;
+    m.showModal(); f.onsubmit = () => { m.close(); route(); };
+  } catch (err) { toast(err.message, true); }
+}
+
 function showAlarm(e) {
   const a = $("#alarm");
   if (!e.on) { a.classList.add("hidden"); return; }
@@ -555,7 +607,7 @@ function showAlarm(e) {
 }
 
 // ------------------------------------------------------------------ router
-const TITLES = {network: "Network", poc: "PoC Phones (Cellular Subscribers)", dashboard: "Dashboard", dvm: "DVM Network (FNE)", bandplan: "Band Plan (Iden Table)", patches: "Talkgroup Patches", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
+const TITLES = {network: "Network", poc: "PoC Phones (Cellular Subscribers)", consoles: "Dispatch Consoles", dashboard: "Dashboard", dvm: "DVM Network (FNE)", bandplan: "Band Plan (Iden Table)", patches: "Talkgroup Patches", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
   subscribers: "Subscriber Radios", sip: "SIP Interconnect", calls: "Call History", settings: "System Settings"};
 async function route() {
   const page = (location.hash.slice(2).split("?")[0]) || "dashboard";

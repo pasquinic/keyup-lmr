@@ -35,7 +35,7 @@ import httpx
 
 from ..config import settings
 from ..db import session_scope
-from ..models import (CallRecord, Channel, IdenEntry, Patch, Site, Subscriber, TalkGroup, now)
+from ..models import (CallRecord, Channel, DispatchConsole, IdenEntry, Patch, Site, Subscriber, TalkGroup, now)
 from .events import bus
 
 log = logging.getLogger("dvm")
@@ -98,6 +98,10 @@ def secret(kind: str, ident) -> str:
     return hmac.new(settings.secret_key.encode(), f"{kind}:{ident}".encode(), hashlib.sha256).hexdigest()[:24]
 
 
+def console_password(peer_id: int) -> str:
+    return secret("console", peer_id)
+
+
 def default_peer_id(site_id: int, slot: int) -> int:
     return 100000 + site_id * 100 + slot
 
@@ -158,6 +162,8 @@ class DvmPlan:
         self.poc_users = [s for s in self.subs if s.get("poc_enabled") and s.get("enabled")]
         self.idens = [i.to_dict() for i in db.query(IdenEntry).order_by(IdenEntry.id).all()]
         self.patches = [p.to_dict() for p in db.query(Patch).order_by(Patch.id).all()]
+        self.consoles = [c.to_dict() for c in db.query(DispatchConsole).order_by(DispatchConsole.id).all()
+                         if c.enabled]
         self.warnings: dict[str, list[str]] = {}
         if _hex(self.s.get("wacn"), "BB800") == "BEE00":
             self.warn("system", "WACN BEE00 is refused by DVM (dvmhost/dvmbridge exit); choose another WACN")
@@ -190,6 +196,30 @@ class DvmPlan:
             if t.get("restricted") and t["id"] not in mine:
                 continue
             out.append(t)
+        return out
+
+    def console_talkgroups(self, con: dict) -> list[dict]:
+        """Talkgroups a dispatch console gets: what its radio ID may use (same rules as a radio),
+        narrowed to the console's own list when one is set."""
+        sub = next((s for s in self.subs if s["id"] == con["subscriber_id"]), None)
+        if sub is None:
+            return []
+        mine = set(sub.get("talkgroup_ids") or [])
+        pick = set(con.get("talkgroup_ids") or [])
+        out = []
+        for t in self.tgs:
+            if not t["enabled"] or (mine and t["id"] not in mine) or (t.get("restricted") and t["id"] not in mine):
+                continue
+            if pick and t["id"] not in pick:
+                continue
+            out.append(t)
+        return out
+
+    def console_peers_by_tg(self) -> dict[int, list[int]]:
+        out: dict[int, list[int]] = {}
+        for c in self.consoles:
+            for t in self.console_talkgroups(c):
+                out.setdefault(t["id"], []).append(c["fne_peer_id"])
         return out
 
     def ic_tgs(self) -> list[dict]:
@@ -239,6 +269,10 @@ class DvmPlan:
                 lines.append(f"{c['peer_id']},{secret('peer', c['peer_id'])},0,{alias},0,0,0,0,4,40000,")
         for pid, alias, _ in self.bridge_peers():
             lines.append(f"{pid},{secret('peer', pid)},0,{alias},0,0,0,0,4,40000,")
+        for c in self.consoles:
+            alias = re.sub(r"[,\n]", " ", f"CONSOLE {c['name']}")[:32]
+            lines.append(f"{c['fne_peer_id']},{console_password(c['fne_peer_id'])},0,{alias},0,"
+                         f"{1 if c['can_inhibit'] else 0},{1 if c['call_priority'] else 0},0,4,40000,")
         return "\n".join(lines) + "\n\n"
 
     def _site_peers(self, site_ids: list[int]) -> list[int]:
@@ -252,10 +286,12 @@ class DvmPlan:
         for s in self.subs:
             for tg in s.get("talkgroup_ids", []):
                 tg_rids.setdefault(tg, []).append(s["id"])
+        consoles = self.console_peers_by_tg()
         groups = []
         for t in self.tgs:
             site_ids = [int(x) for x in str(t.get("site_ids") or "").split(",") if x.strip().isdigit()]
-            inclusion = (self._site_peers(site_ids) + members.get(t["id"], [])) if site_ids else []
+            con = consoles.get(t["id"], [])
+            inclusion = (self._site_peers(site_ids) + members.get(t["id"], []) + con) if site_ids else []
             groups.append({
                 "name": t["name"][:40],
                 "alias": (t.get("description") or t["name"])[:40],
@@ -266,7 +302,7 @@ class DvmPlan:
                     "inclusion": inclusion,
                     "exclusion": [],
                     "rewrite": [],
-                    "always": [],
+                    "always": con,   # dispatch consoles never affiliate; always send them their talkgroups
                     "preferred": [],
                     "rid_permitted": tg_rids.get(t["id"], []) if t.get("restricted") else [],
                 },

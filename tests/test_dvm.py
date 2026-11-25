@@ -140,3 +140,36 @@ def test_poc_talkgroup_rules(plan):
     assert {t["id"] for t in plan.poc_talkgroups(pw_unit)} == {200}        # listed -> allowed
     plan.poc_users = [pw_unit]
     assert [t["id"] for t in plan.ic_tgs()] == [100, 200]                  # SIP TG + PoC user's TG
+
+
+def test_dispatch_console_config(plan):
+    from app.services.consoles import build_codeplug
+    con_open = {"id": 1, "name": "Dispatch 1", "subscriber_id": 1001, "talkgroup_ids": [], "fne_peer_id": 9300001,
+                "can_inhibit": True, "call_priority": True, "enabled": True}
+    con_pw = {"id": 2, "name": "PW desk", "subscriber_id": 2002, "talkgroup_ids": [], "fne_peer_id": 9300002,
+              "can_inhibit": False, "call_priority": False, "enabled": True}
+    plan.consoles = [con_open, con_pw]
+    # same rules as a radio: restricted TG 200 only for the radio ID that lists it
+    assert [t["id"] for t in plan.console_talkgroups(con_open)] == [1, 100]
+    assert [t["id"] for t in plan.console_talkgroups(con_pw)] == [200]
+    assert [t["id"] for t in plan.console_talkgroups({**con_open, "talkgroup_ids": [100]})] == [100]
+    # peer ACL: own password, inhibit + priority flags
+    lines = {l.split(",")[0]: l.split(",") for l in plan.peer_list().splitlines() if l and not l.startswith("#")}
+    assert lines["9300001"][1] == dvm.console_password(9300001) and lines["9300001"][5:7] == ["1", "1"]
+    assert lines["9300002"][5:7] == ["0", "0"] and lines["9300002"][3] == "CONSOLE PW desk"
+    # talkgroup rules: consoles always get their TGs; site-limited TG 200 includes the console peer
+    rules = {g["source"]["tgid"]: g["config"] for g in yaml.safe_load(plan.talkgroup_rules())["groupVoice"]}
+    assert rules[100]["always"] == [9300001] and rules[200]["always"] == [9300002]
+    assert 9300002 in rules[200]["inclusion"] and 9300001 not in rules[200]["inclusion"]
+    # codeplug + aliases parse as YAML in the shape dvmconsole expects
+    cp = build_codeplug(plan, con_open)
+    doc = yaml.safe_load(cp["codeplug"])
+    sysd = doc["systems"][0]
+    assert sysd["peerId"] == 9300001 and sysd["rid"] == "1001" and sysd["password"] == dvm.console_password(9300001)
+    assert sysd["address"] == plan.fne_host and sysd["port"] == plan.fne_port and sysd["name"] == "KeyUp"
+    chans = doc["zones"][0]["channels"]
+    assert [(c["tgid"], c["mode"]) for c in chans] == [("1", "dmr"), ("100", "p25")] and chans[0]["slot"] == 1
+    aliases = yaml.safe_load(cp["alias"])
+    assert {"alias": "PW Truck, 3", "rid": 2002} in aliases and all(a["rid"] != 1001 for a in aliases)  # disabled left out
+    assert cp["version"] == build_codeplug(plan, con_open)["version"]
+    plan.consoles = []

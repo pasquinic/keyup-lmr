@@ -38,6 +38,9 @@ jobs:
           cmake .. -DENABLE_TUI_SUPPORT=off -DCMAKE_BUILD_TYPE=Release
           make -j"$(nproc)" dvmfne dvmhost dvmbridge dvmcmd
       - run: pip install -r central/requirements.txt -r edge/requirements.txt pytest pyyaml
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
       - run: cd mobile && npm ci --legacy-peer-deps
       - run: DVM_BIN_DIR=$PWD/dvm/dvmhost/build python3 tests/lab_dvm_e2e.py
 

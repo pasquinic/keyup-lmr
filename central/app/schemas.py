@@ -152,3 +152,20 @@ class PocActivateIn(BaseModel):
     device_name: str = ""
     platform: str = ""
     app_version: str = ""
+
+
+class ConsoleIn(BaseModel):
+    name: str
+    subscriber_id: int
+    peer_id: int | None = None
+    talkgroup_ids: list[int] = []
+    can_inhibit: bool = True
+    call_priority: bool = True
+    enabled: bool = True
+    notes: str = ""
+
+
+class ConsoleActivateIn(BaseModel):
+    code: str
+    machine: str = ""
+    app_version: str = ""

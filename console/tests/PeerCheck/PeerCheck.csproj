@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Headless check of the KeyUp Dispatch Console's network code (no UI): compiles the console's real
+       PeerSystem / FneSystemBase / KeyUpClient sources with fnecore and a stub MainWindow, activates
+       against a KeyUp server, logs into the FNE and sends / receives P25 voice. Used by tests/lab_dvm_e2e.py. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <Deterministic>false</Deterministic>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <NoWarn>CS0162;CS0168;CS0169;CS0219;CS0414;CS0649;CS8632;CS0067;CS1998</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../fnecore/**/*.cs" Exclude="../../fnecore/obj/**;../../fnecore/bin/**" />
+    <Compile Include="../../dvmconsole/FneSystemBase.cs;../../dvmconsole/FneSystemBase.P25.cs;../../dvmconsole/FneSystemBase.DMR.cs;../../dvmconsole/FneSystemBase.NXDN.cs" />
+    <Compile Include="../../dvmconsole/PeerSystem.cs;../../dvmconsole/Codeplug.cs;../../dvmconsole/Log.cs;../../dvmconsole/KeyUpClient.cs" />
+    <Compile Include="Stubs.cs;Program.cs" />
+  </ItemGroup>
+</Project>

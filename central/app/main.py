@@ -20,7 +20,7 @@ from lmrcommon.vocoder import VocoderPool
 from .api import router
 from .config import settings
 from .db import Base, engine, session_scope, upgrade_schema
-from .models import EdgeDevice, Site, SystemSetting, User, DEFAULT_SYSTEM_SETTINGS
+from .models import DispatchConsole, EdgeDevice, Site, SystemSetting, User, DEFAULT_SYSTEM_SETTINGS
 from .security import hash_secret, user_for_token, verify_secret
 from .services.call_controller import CallController, EdgeSession, VoiceProtocol
 from .services.events import bus
@@ -61,6 +61,8 @@ async def lifespan(app: FastAPI):
                                 settings.wg_endpoint, settings.data_dir, settings.wg_enabled)
     with session_scope() as db:
         peers = [(d.wg_public_key, d.wg_ip) for d in db.query(EdgeDevice).filter(EdgeDevice.status == "active")]
+        peers += [(c.wg_public_key, c.wg_ip) for c in db.query(DispatchConsole)
+                  if c.enabled and c.wg_public_key and c.wg_ip]
     try:
         state.wg.ensure_up(peers)
     except Exception as e:

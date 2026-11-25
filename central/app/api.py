@@ -7,7 +7,7 @@ import threading
 import time
 from collections import Counter
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -16,7 +16,7 @@ from lmrcommon.modes import MODE_CODEC, MODE_LABELS, SystemMode
 from . import schemas as S
 from .config import settings
 from .db import get_db
-from .models import (CallRecord, Channel, EdgeDevice, EnrollmentToken, IdenEntry, Patch, PocDevice, SipRoute,
+from .models import (CallRecord, Channel, DispatchConsole, EdgeDevice, EnrollmentToken, IdenEntry, Patch, PocDevice, SipRoute,
                      Site, Subscriber, SystemSetting, TalkGroup, User, now)
 from .services import dvm, rules
 from .security import current_user, hash_secret, issue_token, verify_secret
@@ -417,7 +417,7 @@ def _enroll(body: S.EnrollIn, db: Session):
         raise HTTPException(400, "invalid WireGuard public key")
     if db.query(EdgeDevice).filter(EdgeDevice.wg_public_key == body.wg_public_key).first():
         raise HTTPException(409, "public key already enrolled")
-    used = {d.wg_ip for d in db.query(EdgeDevice).all()}
+    used = {d.wg_ip for d in db.query(EdgeDevice).all()} | {c.wg_ip for c in db.query(DispatchConsole).all() if c.wg_ip}
     secret = secrets.token_urlsafe(32)
     dev = EdgeDevice(site_id=tok.site_id, hostname=body.hostname, serial=body.serial, model=body.model,
                      agent_version=body.agent_version, wg_public_key=body.wg_public_key,
@@ -582,3 +582,160 @@ def dashboard(db: Session = Depends(get_db)):
                       "server_ip": state.wg.server_ip, "endpoint": state.wg.endpoint,
                       "public_key": state.wg.public_key, "port": state.wg.port},
     }
+
+
+# ============================================================== dispatch consoles (KeyUp fork of dvmconsole)
+def _console_check(db, body: S.ConsoleIn, pk: int | None = None) -> None:
+    if not db.get(Subscriber, body.subscriber_id):
+        raise HTTPException(400, f"radio id {body.subscriber_id} is not a subscriber; add it under Subscriber Radios first")
+    if body.peer_id:
+        if db.query(Channel).filter(Channel.peer_id == body.peer_id).first():
+            raise HTTPException(409, f"peer id {body.peer_id} is used by a channel")
+        other = db.query(DispatchConsole).filter(DispatchConsole.peer_id == body.peer_id).first()
+        if other and other.id != pk:
+            raise HTTPException(409, f"peer id {body.peer_id} is used by console {other.name}")
+
+
+def _console_apply(con: DispatchConsole, body: S.ConsoleIn) -> None:
+    data = body.model_dump()
+    data["talkgroup_ids"] = ",".join(str(t) for t in data["talkgroup_ids"])
+    for k, v in data.items():
+        setattr(con, k, v)
+
+
+def _console_codeplug(db, con: DispatchConsole) -> dict:
+    from .services.consoles import build_codeplug
+    return build_codeplug(dvm.DvmPlan(db), con.to_dict())
+
+
+@router.get("/consoles", dependencies=admin)
+def list_consoles(db: Session = Depends(get_db)):
+    fne_peers = {p["peer_id"]: p for p in ((state.fne.status() if state.fne else {}).get("peers") or [])}
+    wg = state.wg.peer_status() if state.wg else {}
+    plan = dvm.DvmPlan(db)
+    out = []
+    for c in db.query(DispatchConsole).order_by(DispatchConsole.id).all():
+        d = c.to_dict()
+        sub = db.get(Subscriber, c.subscriber_id)
+        d["subscriber_alias"] = sub.alias if sub else "?"
+        d["fne"] = fne_peers.get(c.fne_peer_id)
+        d["online"] = bool(d["fne"] and d["fne"].get("connected", True))
+        d["wg"] = wg.get(c.wg_public_key) if c.wg_public_key else None
+        d["talkgroups"] = [t["id"] for t in plan.console_talkgroups(d)]
+        out.append(d)
+    return out
+
+
+@router.post("/consoles", dependencies=admin)
+async def create_console(body: S.ConsoleIn, db: Session = Depends(get_db)):
+    _console_check(db, body)
+    con = DispatchConsole()
+    _console_apply(con, body)
+    db.add(con)
+    db.commit()
+    await changed()
+    return con.to_dict()
+
+
+@router.put("/consoles/{pk}", dependencies=admin)
+async def update_console(pk: int, body: S.ConsoleIn, db: Session = Depends(get_db)):
+    con = _get_or_404(db, DispatchConsole, pk)
+    _console_check(db, body, pk)
+    _console_apply(con, body)
+    db.commit()
+    await changed()
+    return con.to_dict()
+
+
+@router.delete("/consoles/{pk}", dependencies=admin)
+async def delete_console(pk: int, db: Session = Depends(get_db)):
+    con = _get_or_404(db, DispatchConsole, pk)
+    if con.wg_public_key and state.wg:
+        state.wg.remove_peer(con.wg_public_key)
+    db.delete(con)
+    db.commit()
+    await changed()
+    return {"ok": True}
+
+
+@router.post("/consoles/{pk}/activation", dependencies=admin)
+def console_activation(pk: int, db: Session = Depends(get_db)):
+    """Issue a one-time code that the console app trades for its codeplug, token and WireGuard tunnel."""
+    con = _get_or_404(db, DispatchConsole, pk)
+    secret_part = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(8))
+    con.activation_hash = hash_secret(secret_part)
+    con.activation_expires = now() + dt.timedelta(hours=24)
+    db.commit()
+    return {"console_id": con.id, "name": con.name, "server": settings.public_url,
+            "code": f"{con.id}-{secret_part[:4]}-{secret_part[4:]}",
+            "expires_at": con.activation_expires.isoformat() + "Z"}
+
+
+@router.post("/consoles/{pk}/revoke", dependencies=admin)
+async def console_revoke(pk: int, db: Session = Depends(get_db)):
+    """Log the console out: its token stops working and its WireGuard tunnel is removed."""
+    con = _get_or_404(db, DispatchConsole, pk)
+    if con.wg_public_key and state.wg:
+        state.wg.remove_peer(con.wg_public_key)
+    con.token_hash, con.wg_public_key, con.activation_hash = "", "", ""
+    con.enabled = False
+    db.commit()
+    await changed()
+    bus.publish("console", action="revoked", console=con.id, name=con.name)
+    return con.to_dict()
+
+
+@router.get("/consoles/{pk}/codeplug", dependencies=admin)
+def console_codeplug_admin(pk: int, db: Session = Depends(get_db)):
+    return _console_codeplug(db, _get_or_404(db, DispatchConsole, pk))
+
+
+# ---- called by the console app (public; protected by the activation code / console token)
+@router.post("/console/activate")
+async def console_activate(body: S.ConsoleActivateIn, db: Session = Depends(get_db)):
+    from .services.consoles import wireguard_conf
+    from .services.poc import new_token, token_hash
+    from .services.wireguard import generate_keypair
+    raw = body.code.strip().upper().replace(" ", "")
+    head, _, rest = raw.partition("-")
+    con = db.get(DispatchConsole, int(head)) if head.isdigit() else None
+    code = rest.replace("-", "")
+    if (not con or not con.activation_hash or not con.activation_expires or con.activation_expires < now()
+            or not verify_secret(code, con.activation_hash)):
+        time.sleep(1)
+        raise HTTPException(403, "invalid or expired activation code")
+    with _enroll_lock:
+        if con.wg_public_key and state.wg:
+            state.wg.remove_peer(con.wg_public_key)
+        priv, pub = generate_keypair()
+        if not con.wg_ip:
+            used = {d.wg_ip for d in db.query(EdgeDevice).all()} | {
+                c.wg_ip for c in db.query(DispatchConsole).all() if c.wg_ip}
+            con.wg_ip = state.wg.allocate_ip(used)
+        con.wg_public_key = pub
+        token = new_token()
+        con.token_hash = token_hash(token)
+        con.activation_hash, con.activation_expires = "", None
+        con.enabled = True
+        con.activated_at = con.last_sync = now()
+        db.commit()
+        state.wg.add_peer(pub, con.wg_ip)
+    await changed()
+    cp = _console_codeplug(db, con)
+    bus.publish("console", action="activated", console=con.id, name=con.name, machine=body.machine[:64])
+    return {"token": token, "console_id": con.id, "name": con.name, "server": settings.public_url,
+            "wireguard_conf": wireguard_conf(priv, state.wg.client_config(con.wg_ip), con.name),
+            "tunnel_ip": con.wg_ip, "fne": f"{dvm.DvmPlan(db).fne_host}:{dvm.DvmPlan(db).fne_port}", **cp}
+
+
+@router.get("/console/codeplug")
+def console_codeplug(authorization: str = Header(default=""), db: Session = Depends(get_db)):
+    from .services.poc import token_hash
+    token = authorization.removeprefix("Bearer ").strip()
+    con = db.query(DispatchConsole).filter(DispatchConsole.token_hash == token_hash(token or "-")).first() if token else None
+    if not con or not con.enabled:
+        time.sleep(0.5)
+        raise HTTPException(403, "console not activated, or revoked")
+    con.last_sync = now()
+    db.commit()
+    return {"console_id": con.id, "name": con.name, **_console_codeplug(db, con)}

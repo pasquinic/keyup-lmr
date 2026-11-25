@@ -11,6 +11,9 @@ Runs KeyUp central, the DVM supervisor (dvmfne + dvmbridges) and two edge agents
   * cross-mode patch: that P25 call is re-vocoded onto a DMR talkgroup
   * PoC phones (protocol client): activation, talkgroup rules, a phone transmits as its own
     radio ID, phone-to-phone and radio-to-phone audio, busy / not-permitted denials, inhibit
+  * dispatch console (the KeyUp console's own network code, headless): activation, codeplug and
+    WireGuard file, FNE login as its own peer, P25 transmit as its radio ID, receive radio traffic,
+    restricted talkgroups left out, codeplug re-sync, revoke
   * FNE outage -> edges report SITE TRUNKING; FNE back -> wide area
 """
 import json
@@ -23,6 +26,8 @@ import sys
 import tempfile
 import time
 import asyncio
+import select
+import urllib.error
 import urllib.request
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -122,6 +127,81 @@ async def poc_checks(tokens: dict, tmp: str) -> str:
             f"frames, radio-to-phone with talker {rx['src']}, busy/not-permitted denials, inhibit enforced{extra}")
 
 
+def console_checks(tmp: str, peers) -> str:
+    """Run the dispatch console's real network code (console/tests/PeerCheck) against the live system."""
+    if not shutil.which("dotnet"):
+        return "SKIPPED (install the .NET 8 SDK to run the dispatch console check)"
+    out = f"{tmp}/peercheck"
+    b = subprocess.run(["dotnet", "build", "-c", "Release", "-o", out, f"{ROOT}/console/tests/PeerCheck"],
+                       capture_output=True, text=True, timeout=600)
+    assert b.returncode == 0, b.stdout[-3000:]
+    req("POST", "/api/subscribers", {"id": 3001, "alias": "Dispatch", "talkgroup_ids": []})
+    req("POST", "/api/talkgroups", {"id": 500, "name": "Secure", "restricted": True, "bridge_mode": "P25P1"})
+    con = req("POST", "/api/consoles", {"name": "Dispatch 1", "subscriber_id": 3001})
+    pid = con["fne_peer_id"]
+    code = req("POST", f"/api/consoles/{con['id']}/activation", {})["code"]
+    try:
+        req("POST", "/api/console/activate", {"code": f"{con['id']}-AAAA-AAAA"}, auth=False)
+        raise AssertionError("bad console code accepted")
+    except urllib.error.HTTPError as e:
+        assert e.code == 403, e
+    p = subprocess.Popen(["dotnet", f"{out}/PeerCheck.dll", BASE, code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=open(f"{tmp}/peercheck.log", "w"), text=True, bufsize=1)
+
+    def line(timeout=30):
+        if not select.select([p.stdout], [], [], timeout)[0]:
+            raise AssertionError(f"console harness silent ({tmp}/peercheck.log)")
+        msg = json.loads(p.stdout.readline())
+        assert msg["event"] != "error" or msg.get("refused") is not None, msg
+        return msg
+
+    def cmd(c, timeout=30):
+        p.stdin.write(c + "\n")
+        p.stdin.flush()
+        return line(timeout)
+    try:
+        act = line()
+        assert act["event"] == "activated" and sorted(act["talkgroups"]) == ["1", "100"], act   # restricted TG 500 left out
+        assert act["alias_ok"] and act["wireguard_ok"] and act["tunnel_ip"] and act["fne"] == "127.0.0.1:62131", act
+        assert line()["event"] == "connected"
+        wait(lambda: pid in peers(), 30, "console peer on the FNE")
+        wait(lambda: req("GET", "/api/consoles")[0]["online"], 15, "console shown online in the web UI")
+        row = req("GET", "/api/consoles")[0]
+        assert row["activated"] and row["talkgroups"] == [1, 100] and row["wg_ip"] == act["tunnel_ip"], row
+        # console PTT on TG 100: reaches the FNE as the console's radio ID, recorded in call history
+        tx = cmd("tx 100 3", 30)
+        assert tx["event"] == "tx_done" and tx["ldus"] > 10, tx
+        time.sleep(1.5)
+        log = open(f"{tmp}/dvm.log").read()
+        assert f"P25, Call Start, peer = {pid}" in log and "srcId = 3001, dstId = 100" in log, "console call not on the FNE"
+        wait(lambda: any(c["source_id"] == 3001 and c["talkgroup_id"] == 100 for c in req("GET", "/api/calls")), 10,
+             "console call in history")
+        # radio traffic on TG 100 (patch bridge) is heard on the console
+        cmd("rx")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for i in range(100):
+            s.sendto(struct.pack("!BBHII", 0x80, 0, i, i * 160, 9) + audio.pcm_to_ulaw(audio.tone(900, 20, 0.4, i * 160)),
+                     ("127.0.0.1", 36003))
+            time.sleep(0.02)
+        time.sleep(1.5)
+        rx = cmd("rx")
+        assert rx["frames"].get("100", 0) >= 8 and 9200003 in rx["sources"].get("100", []), rx
+        # talkgroup change in the web UI reaches the console on sync
+        req("PUT", f"/api/consoles/{con['id']}", {"name": "Dispatch 1", "subscriber_id": 3001, "talkgroup_ids": [100]})
+        sy = cmd("sync")
+        assert sy["event"] == "sync" and sy["changed"] and sy["talkgroups"] == ["100"], sy
+        assert cmd("sync")["changed"] is False
+        # revoke: the console's token stops working
+        req("POST", f"/api/consoles/{con['id']}/revoke", {})
+        rv = cmd("sync")
+        assert rv["event"] == "error" and rv["refused"], rv
+        p.stdin.write("quit\n")
+    finally:
+        p.kill()
+    return (f"console peer {pid} logged into the FNE, keyed TG 100 as RID 3001 (FNE + call history), heard "
+            f"{rx['frames']['100']} LDUs from radio 9200003, restricted TG left out, re-sync and revoke work")
+
+
 def main():
     global TOKEN
     if not BIN or not os.path.exists(os.path.join(BIN, "dvmfne")):
@@ -189,6 +269,7 @@ def main():
         wait(lambda: len(peers()) == 6 and 9100000 in peers(), 60, "interconnect bridge for TG 100 up")
         ps = asyncio.run(poc_checks(tokens, tmp))
         print(f"ok  PoC: {ps}")
+        print(f"ok  Dispatch console: {console_checks(tmp, peers)}")
 
         procs.pop("sup").terminate()
         wait(lambda: all(req("GET", "/status", base=f"http://127.0.0.1:{18190 + n}", auth=False)["mode"] == "site_trunking"

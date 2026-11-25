@@ -9,6 +9,7 @@ KeyUp is a trunked land-mobile-radio system for a personal network. It has three
 | **Central + edges** | `central/`, `edge/`, `lmrcommon/` | Web management, WireGuard hub, enrollment, config compiler, SIP interconnect and dashboard; Raspberry Pi edge agent with site trunking |
 | **KeyUp DVM fork** | `dvm/dvmhost/` | A maintained fork of [DVMProject/dvmhost](https://github.com/DVMProject/dvmhost): `dvmfne`, `dvmhost`, `dvmbridge`, `dvmcmd` (P25 Phase I, DMR, NXDN, analog) |
 | **KeyUp PoC app** | `mobile/` | Android and iOS push-to-talk app; each phone is a subscriber radio with the same rules as an RF radio |
+| **KeyUp Dispatch Console** | `console/` | Windows dispatch console, a fork of [DVMProject/dvmconsole](https://github.com/DVMProject/dvmconsole): joins the FNE as its own peer over WireGuard and transmits as a radio ID |
 
 Two call backends are available, chosen in **System Settings → `call_backend`**:
 
@@ -82,12 +83,23 @@ To provision a phone, press **PoC QR** on a subscriber, then scan the QR code in
 
 | Build | How | Output |
 |---|---|---|
+| Windows dispatch console | GitHub Actions **Console · Windows build** (on every push to `console/`; tag `console-vX.Y.Z` to publish a Release) | `KeyUp-Dispatch-Console-win-x86.zip` (self-contained, includes `libvocoder.dll`) |
 | Android APK | GitHub Actions **Mobile · Android build** (on every push to `mobile/`, or run manually) | `KeyUp-PoC.apk` artifact; signed with your key if the `ANDROID_KEYSTORE_*` secrets are set, otherwise debug-signed for side-loading |
 | iOS Simulator | GitHub Actions **Mobile · iOS build** (macOS runner) | `KeyUp-PoC-simulator.zip` artifact |
 | Signed iOS + Android | GitHub Actions **Mobile · EAS build** (manual; needs an `EXPO_TOKEN` secret) or `npx eas-cli build` | Installable IPA/APK, or store bundles with the `production` profile |
 | Local | `cd mobile && npx expo run:android` / `npx expo run:ios` | Debug build on a connected device |
 
 Installing on iPhones requires an Apple Developer account; EAS handles the certificates. One-time EAS setup is in `mobile/README.md`.
+
+## Dispatch consoles (Windows)
+
+The **KeyUp Dispatch Console** (`console/`) puts dispatch on a Windows PC. It's KeyUp's fork of DVMProject's desktop console, so it has a channel grid, PTT, paging, radio check, inhibit and call history. KeyUp provisions it:
+- **Dispatch Consoles** page: pick the radio ID the console transmits as, optionally narrow its talkgroups, and choose whether it may inhibit radios and has call priority.
+- **Activate** gives a one-time code. In the console, **File → Connect to KeyUp Server** trades it for the console's codeplug, radio aliases and a WireGuard tunnel file for WireGuard for Windows.
+- On the FNE, the console is its own peer (`9300000 +` console number) with its own password. It's on the always-send list for its talkgroups, so it hears them even when they are "affiliated only".
+- Talkgroup and alias changes reach the console on its next start, or with **File → Sync with KeyUp**. **Revoke** cuts it off.
+
+Download `KeyUp-Dispatch-Console-win-x86.zip` from the repository's Releases (or the **Console · Windows build** Actions run). Unzip it and run `DVMConsole.exe`; no install or .NET is needed. Details are in `console/README.md`.
 
 ## System rules and network tools
 
@@ -119,7 +131,7 @@ docker compose --profile sip up -d            # optional Asterisk (set ARI_ENABL
 
 sudo ufw allow 80,443/tcp && sudo ufw allow 51820/udp
 sudo ufw allow in on wg-lmr to any port 8080,50000 proto tcp
-sudo ufw allow in on wg-lmr to any port 62031 proto udp       # DVM peers only inside the tunnel
+sudo ufw allow in on wg-lmr to any port 62031 proto udp       # DVM peers (edges, consoles) only inside the tunnel
 sudo ufw enable
 ```
 
@@ -168,6 +180,7 @@ cd mobile && npm run typecheck && npx eslint src && npm test   # app
 - every generated config is accepted and the P25 voice channel attaches to its control channel;
 - SIP audio becomes a P25 call that KeyUp records, and the patch re-vocodes it onto DMR;
 - PoC phones transmit with their own radio ID, hear radio traffic, get busy and not-permitted denials, and are cut off when inhibited; the app's TypeScript client keys up against the live server;
+- the dispatch console's own network code (built headless from `console/tests/PeerCheck`, needs the .NET 8 SDK) activates, logs into the FNE as its peer, transmits P25 as its radio ID, hears radio traffic, leaves out restricted talkgroups, re-syncs and is revoked;
 - the fork's structured call-event feed is active;
 - an FNE outage puts both sites into site trunking, and they return to wide area afterwards.
 
@@ -183,4 +196,4 @@ GitHub Actions (`.github/workflows/ci.yml`) runs all of these on every push.
 
 ## License
 
-KeyUp is licensed under the **GNU General Public License v2.0** (`LICENSE`), because it includes and modifies DVMProject's GPL-2.0 code. DVMProject's copyright notices are kept in every file of the fork; see `NOTICE` and `dvm/FORK.md`.
+KeyUp is licensed under the **GNU General Public License v2.0** (`LICENSE`), because it includes and modifies DVMProject's GPL-2.0 code. DVMProject's copyright notices are kept in every file of the fork; see `NOTICE` and `dvm/FORK.md`. The Windows dispatch console (`console/`) is a separate program under the **AGPL-3.0**, as its upstream is; see `console/FORK.md`.
