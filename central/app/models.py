@@ -32,6 +32,19 @@ subscriber_talkgroups = Table(
 )
 
 
+subscriber_zones = Table(
+    "subscriber_zones", Base.metadata,
+    Column("subscriber_id", ForeignKey("subscribers.id", ondelete="CASCADE"), primary_key=True),
+    Column("zone_id", ForeignKey("zones.id", ondelete="CASCADE"), primary_key=True),
+)
+
+console_zones = Table(
+    "console_zones", Base.metadata,
+    Column("console_id", ForeignKey("dispatch_consoles.id", ondelete="CASCADE"), primary_key=True),
+    Column("zone_id", ForeignKey("zones.id", ondelete="CASCADE"), primary_key=True),
+)
+
+
 class User(DictMixin, Base):
     __tablename__ = "users"
     _hidden = ("password_hash",)
@@ -117,6 +130,8 @@ class TalkGroup(DictMixin, Base):
     parrot: Mapped[bool] = mapped_column(Boolean, default=False)          # echo each transmission back (test TG)
     site_ids: Mapped[str] = mapped_column(String(256), default="")        # comma list of allowed sites; blank = all
     sip_extension: Mapped[str] = mapped_column(String(32), default="")
+    allow_poc: Mapped[bool] = mapped_column(Boolean, default=True)        # PoC phones may use it (if permitted)
+    record: Mapped[bool] = mapped_column(Boolean, default=True)           # record audio (when recording is on)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
@@ -153,9 +168,21 @@ class Channel(DictMixin, Base):
     signaling: Mapped[str] = mapped_column(String(8), default="gpio")   # gpio | serial
     serial_port: Mapped[str] = mapped_column(String(64), default="")
     cor_invert: Mapped[bool] = mapped_column(Boolean, default=False)    # serial: CTS low = carrier
+    # how the edge reaches this channel: an analog/vocoded radio (audio + COR/PTT), or packetized voice
+    interface: Mapped[str] = mapped_column(String(12), default="radio")  # radio | dfsi | ipsc | capplus
+    packet_config: Mapped[str] = mapped_column(Text, default="{}")      # JSON settings for packet interfaces
+    extra_talkgroups: Mapped[str] = mapped_column(String(512), default="")  # packet: more TGs carried ("*" = all)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
     site = relationship("Site", back_populates="channels")
+
+    def to_dict(self):
+        d = super().to_dict()
+        try:
+            d["packet_config"] = json.loads(self.packet_config or "{}")
+        except ValueError:
+            d["packet_config"] = {}
+        return d
 
 
 class Subscriber(DictMixin, Base):
@@ -173,11 +200,85 @@ class Subscriber(DictMixin, Base):
     last_tg_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
+    poc_enabled: Mapped[bool] = mapped_column(Boolean, default=False)   # may use the PoC phone app
+
     talkgroups = relationship("TalkGroup", secondary=subscriber_talkgroups, lazy="selectin")
+    zones = relationship("Zone", secondary=subscriber_zones, lazy="selectin")
 
     def to_dict(self):
         d = super().to_dict()
         d["talkgroup_ids"] = [t.id for t in self.talkgroups]
+        d["zone_ids"] = [z.id for z in self.zones]
+        return d
+
+
+class Zone(DictMixin, Base):
+    """An ordered set of talkgroups, like a zone in a radio codeplug. Radios, PoC phones and dispatch
+    consoles are given zones; each shows only the talkgroups its radio ID may use."""
+    __tablename__ = "zones"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(32))
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    color: Mapped[str] = mapped_column(String(9), default="")
+    notes: Mapped[str] = mapped_column(Text, default="")
+
+    members = relationship("ZoneMember", order_by="ZoneMember.position", cascade="all, delete-orphan",
+                           lazy="selectin")
+
+    def to_dict(self):
+        d = super().to_dict()
+        d["talkgroup_ids"] = [m.talkgroup_id for m in self.members]
+        return d
+
+
+class ZoneMember(Base):
+    __tablename__ = "zone_talkgroups"
+    zone_id: Mapped[int] = mapped_column(ForeignKey("zones.id", ondelete="CASCADE"), primary_key=True)
+    talkgroup_id: Mapped[int] = mapped_column(ForeignKey("talkgroups.id", ondelete="CASCADE"), primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class PocDevice(DictMixin, Base):
+    """A phone running the KeyUp PoC app, acting as the subscriber radio it is bound to."""
+    __tablename__ = "poc_devices"
+    _hidden = ("token_hash", "activation_hash")
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(64), default="")
+    platform: Mapped[str] = mapped_column(String(16), default="")
+    app_version: Mapped[str] = mapped_column(String(16), default="")
+    token_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+    last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class DispatchConsole(DictMixin, Base):
+    """A PC running the KeyUp Dispatch Console. It transmits as one subscriber radio ID."""
+    __tablename__ = "dispatch_consoles"
+    _hidden = ("token_hash", "activation_hash")
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(64))
+    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id", ondelete="CASCADE"), index=True)
+    can_inhibit: Mapped[bool] = mapped_column(Boolean, default=True)      # may inhibit / uninhibit radios
+    call_priority: Mapped[bool] = mapped_column(Boolean, default=True)    # may talk over radios
+    can_patch: Mapped[bool] = mapped_column(Boolean, default=True)        # may create talkgroup patches
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    wg_public_key: Mapped[str] = mapped_column(String(64), default="")
+    wg_ip: Mapped[str] = mapped_column(String(45), default="")
+    token_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
+    activation_hash: Mapped[str] = mapped_column(String(128), default="")
+    activation_expires: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    activated_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    notes: Mapped[str] = mapped_column(Text, default="")
+
+    zones = relationship("Zone", secondary=console_zones, lazy="selectin")
+
+    def to_dict(self):
+        d = super().to_dict()
+        d["zone_ids"] = [z.id for z in self.zones]
+        d["activated"] = bool(self.token_hash)
         return d
 
 
@@ -234,10 +335,17 @@ class CallRecord(DictMixin, Base):
     via_sip: Mapped[bool] = mapped_column(Boolean, default=False)
     site_trunking: Mapped[bool] = mapped_column(Boolean, default=False)
     result: Mapped[str] = mapped_column(String(32), default="granted")  # granted|denied:<reason>|preempted
+    talkers: Mapped[str] = mapped_column(Text, default="[]")    # [{src, alias, at (s into call), dur, via}]
+    recording: Mapped[str] = mapped_column(String(256), default="")   # file under the recordings folder
+    recording_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    recording_note: Mapped[str] = mapped_column(String(128), default="")  # e.g. why there is no audio
+    ship_status: Mapped[str] = mapped_column(String(16), default="")      # ""|queued|sent|failed:<why>
+    shipped_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     def to_dict(self):
         d = super().to_dict()
         d["dest_sites"] = json.loads(self.dest_sites or "[]")
+        d["talkers"] = json.loads(self.talkers or "[]")
         return d
 
 
@@ -261,4 +369,15 @@ DEFAULT_SYSTEM_SETTINGS = {
     "affiliation_timeout_s": "1800",   # a radio counts as affiliated at a site this long after it was heard
     "cw_id_interval_s": "600",         # edges identify each transmitter in CW at most this often
     "parrot_delay_ms": "1000",
+    # call recording
+    "recording_enabled": "true",
+    "recording_retention_days": "30",
+    "recording_max_gb": "20",
+    # ship recordings to a second server: off | siprec | sip | https
+    "recording_ship_mode": "off",
+    "recording_ship_target": "",        # siprec/sip: sip:recorder@host[:port]; https: URL
+    "recording_ship_transport": "udp",  # sip: udp | tcp
+    "recording_ship_username": "",
+    "recording_ship_password": "",
+    "recording_ship_token": "",         # https: bearer token
 }

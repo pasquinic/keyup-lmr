@@ -123,3 +123,11 @@ legend{color:var(--muted);font-size:12px;padding:0 6px}
   #page{padding:14px}
   header{padding:12px 14px}
 }
+
+/* ordered list picker (zones) */
+.ordered { display: flex; flex-direction: column; gap: 6px; }
+.ordered ol { margin: 0; padding-left: 22px; max-height: 260px; overflow: auto; }
+.ordered li { display: flex; align-items: center; gap: 4px; padding: 2px 0; }
+.ordered li span { flex: 1; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: middle; }
+.chip { display: inline-block; padding: 1px 6px; border-radius: 9px; background: var(--chip, rgba(127,127,127,.15)); margin: 1px 0; font-size: 12px; }

@@ -47,13 +47,23 @@ async function options(src) {
   cache[src] = await api("/" + src);
   return cache[src].map(o => ({value: o.id, label: `${o.id} — ${o.name ?? o.alias ?? o.label ?? ""}`}));
 }
+function getPath(obj, path) { return path.split(".").reduce((o, k) => (o == null ? undefined : o[k]), obj); }
+function setPath(obj, path, val) {
+  const keys = path.split("."), last = keys.pop();
+  let o = obj;
+  for (const k of keys) o = (o[k] ??= {});
+  o[last] = val;
+}
+function orderedItem(v, label) {
+  return `<li data-v="${esc(v)}"><span>${esc(label)}</span><button class="btn sm ghost" data-act="up" title="Move up">↑</button><button class="btn sm ghost" data-act="down" title="Move down">↓</button><button class="btn sm ghost" data-act="rm" title="Remove">✕</button></li>`;
+}
 async function formModal(title, fields, values = {}, submitLabel = "Save", onSubmit = null) {
   const m = $("#modal"), f = $("#modalForm");
   let html = `<h2>${esc(title)}</h2><div class="formgrid">`;
   let group = null;
   for (const fd of fields) {
     if (fd.group !== group) { if (group) html += `</fieldset>`; group = fd.group; if (group) html += `<fieldset><legend>${esc(group)}</legend>`; }
-    const v = values[fd.name] ?? fd.default ?? "";
+    const v = getPath(values, fd.name) ?? fd.default ?? "";
     const cls = fd.wide ? ' class="wide"' : "";
     if (fd.type === "bool") { html += `<label class="check"${cls}><input type="checkbox" name="${fd.name}" ${v ? "checked" : ""}> ${esc(fd.label)}</label>`; continue; }
     if (fd.type === "select" || fd.type === "multi") {
@@ -64,21 +74,48 @@ async function formModal(title, fields, values = {}, submitLabel = "Save", onSub
         opts.map(o => `<option value="${esc(o.value)}" ${sel.has(String(o.value)) ? "selected" : ""}>${esc(o.label)}</option>`).join("") + `</select></label>`;
       continue;
     }
+    if (fd.type === "ordered") {
+      const opts = await options(fd.options);
+      const label = new Map(opts.map(o => [String(o.value), o.label]));
+      const items = (v || []).map(String).filter(x => label.has(x));
+      html += `<div class="ordered wide" data-name="${esc(fd.name)}"><span>${esc(fd.label)}</span><ol>` +
+        items.map(x => orderedItem(x, label.get(x))).join("") +
+        `</ol><select data-add><option value="">+ add…</option>${opts.map(o => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join("")}</select></div>`;
+      continue;
+    }
     if (fd.type === "textarea") { html += `<label${cls}>${esc(fd.label)}<textarea name="${fd.name}" rows="3">${esc(v)}</textarea></label>`; continue; }
     html += `<label${cls}>${esc(fd.label)}<input name="${fd.name}" type="${fd.type === "number" ? "number" : "text"}" step="any" value="${esc(v)}" ${fd.required ? "required" : ""} ${fd.readonly && values[fd.name] !== undefined ? "readonly" : ""} placeholder="${esc(fd.placeholder ?? "")}"></label>`;
   }
   if (group) html += `</fieldset>`;
   html += `</div><p class="err" id="formErr"></p><div class="formfoot"><button class="btn ghost" value="cancel" formnovalidate>Cancel</button><button class="btn primary" value="ok">${esc(submitLabel)}</button></div>`;
   f.innerHTML = html; m.showModal();
+  f.querySelectorAll(".ordered").forEach(box => {
+    const ol = box.querySelector("ol"), add = box.querySelector("[data-add]");
+    add.onchange = () => {
+      if (add.value && !ol.querySelector(`[data-v="${CSS.escape(add.value)}"]`))
+        ol.insertAdjacentHTML("beforeend", orderedItem(add.value, add.selectedOptions[0].textContent));
+      add.value = "";
+    };
+    ol.onclick = e => {
+      const li = e.target.closest("li"), act = e.target.dataset.act;
+      if (!li || !act) return;
+      e.preventDefault();
+      if (act === "up" && li.previousElementSibling) li.parentNode.insertBefore(li, li.previousElementSibling);
+      if (act === "down" && li.nextElementSibling) li.parentNode.insertBefore(li.nextElementSibling, li);
+      if (act === "rm") li.remove();
+    };
+  });
   const collect = () => {
     const out = {};
+    const put = (name, val) => setPath(out, name, val);
     for (const fd of fields) {
+      if (fd.type === "ordered") { put(fd.name, [...f.querySelectorAll(`.ordered[data-name="${CSS.escape(fd.name)}"] li`)].map(li => Number(li.dataset.v))); continue; }
       const el = f.elements[fd.name];
-      if (fd.type === "bool") out[fd.name] = el.checked;
-      else if (fd.type === "multi") out[fd.name] = [...el.selectedOptions].map(o => Number(o.value));
-      else if (fd.type === "number") out[fd.name] = el.value === "" ? (fd.nullable ? null : 0) : Number(el.value);
-      else if (fd.type === "select") out[fd.name] = el.value === "" ? null : (fd.numeric ? Number(el.value) : el.value);
-      else out[fd.name] = el.value;
+      if (fd.type === "bool") put(fd.name, el.checked);
+      else if (fd.type === "multi") put(fd.name, [...el.selectedOptions].map(o => Number(o.value)));
+      else if (fd.type === "number") put(fd.name, el.value === "" ? (fd.nullable ? null : 0) : Number(el.value));
+      else if (fd.type === "select") put(fd.name, el.value === "" ? null : (fd.numeric ? Number(el.value) : el.value));
+      else put(fd.name, el.value);
     }
     return out;
   };
@@ -244,6 +281,8 @@ pages.talkgroups = resourcePage({
     {name: "hang_time_ms", label: "Hang time (ms)", type: "number", default: 3000}, {name: "emergency_enabled", label: "Emergency calls allowed", type: "bool", default: true},
     {name: "allow_sip", label: "Allow SIP interconnect", type: "bool"}, {name: "sip_extension", label: "SIP dial extension", placeholder: "e.g. 7101"},
     {name: "enabled", label: "Enabled", type: "bool", default: true},
+    {name: "allow_poc", label: "PoC phones may use it", type: "bool", default: true},
+    {name: "record", label: "Record audio (when recording is on)", type: "bool", default: true},
     {name: "restricted", label: "Restricted: only radios that list this TG may talk", type: "bool", group: "Routing rules"},
     {name: "affiliated_only", label: "Repeat only at sites where a radio on this TG was heard", type: "bool", group: "Routing rules"},
     {name: "parrot", label: "Parrot: echo each transmission back to the talker", type: "bool", group: "Routing rules"},
@@ -267,6 +306,21 @@ const CHANNEL_FIELDS = [
   {name: "signaling", label: "PTT / COR via", type: "select", options: [{value: "gpio", label: "GPIO pins"}, {value: "serial", label: "Serial port RTS (PTT) / CTS (COR)"}], default: "gpio", group: "Edge hardware"},
   {name: "serial_port", label: "Serial port (serial signalling)", placeholder: "/dev/ttyUSB0", group: "Edge hardware"},
   {name: "cor_invert", label: "Invert CTS (serial)", type: "bool", group: "Edge hardware"},
+  {name: "interface", label: "Interface", type: "select", default: "radio", group: "Interface", options: [
+    {value: "radio", label: "Radio: audio + PTT/COR (analog or vocoded on the edge)"},
+    {value: "dfsi", label: "DFSI: P25 fixed station over IP (TIA-102.BAHA)"},
+    {value: "ipsc", label: "IP Site Connect: MOTOTRBO repeaters (DMR)"},
+    {value: "capplus", label: "Capacity Plus: MOTOTRBO Cap+ system (DMR)"}]},
+  {name: "extra_talkgroups", label: "Packet: more talkgroups carried (comma list, * = all)", placeholder: "*", group: "Interface"},
+  {name: "packet_config.local_port", label: "Packet: local UDP port the edge listens on", type: "number", group: "Interface"},
+  {name: "packet_config.remote_host", label: "Packet: remote host (DFSI station / IPSC master)", group: "Interface"},
+  {name: "packet_config.remote_port", label: "Packet: remote UDP port", type: "number", group: "Interface"},
+  {name: "packet_config.role", label: "IPSC role", type: "select", default: "master", group: "Interface", options: [
+    {value: "master", label: "KeyUp is the IPSC master (repeaters register to the edge)"}, {value: "peer", label: "KeyUp joins an existing master as a peer"}]},
+  {name: "packet_config.peer_id", label: "IPSC / Cap+: KeyUp's peer (radio) ID", type: "number", group: "Interface"},
+  {name: "packet_config.auth_key", label: "IPSC / Cap+: authentication key (hex, blank = none)", group: "Interface"},
+  {name: "packet_config.timeslots", label: "IPSC / Cap+: timeslots carried", type: "select", default: "both", group: "Interface",
+    options: [{value: "both", label: "Both"}, {value: "1", label: "Timeslot 1"}, {value: "2", label: "Timeslot 2"}]},
 ];
 pages.channels = resourcePage({
   path: "channels", listPath: "frequencies", title: "Channel",
@@ -279,18 +333,49 @@ pages.channels = resourcePage({
   fields: CHANNEL_FIELDS,
 });
 
+pages.zones = async el => {
+  await options("zones");
+  await options("talkgroups");
+  await resourcePage({
+    path: "zones", title: "Zone",
+    extraToolbar: `<a class="btn" href="/api/zones/export.csv" id="zoneCsv" download>Export channel plan (CSV)</a>`,
+    columns: [{key: "position", label: "Order"}, {label: "Zone", render: r => `${r.color ? `<span class="swatch" style="background:${esc(r.color)}"></span>` : ""}${esc(r.name)}`},
+      {label: "Talkgroups (in order)", render: r => r.talkgroup_ids.length ? r.talkgroup_ids.map(t => `<span class="chip">${esc(t)} ${esc(cache.talkgroups.find(x => x.id === t)?.name ?? "")}</span>`).join(" ") : '<span class="muted">empty</span>'},
+      {key: "notes", label: "Notes"}],
+    fields: [{name: "name", label: "Name (as shown on radios, phones and consoles)", required: true},
+      {name: "position", label: "Order (lower first)", type: "number", default: 0},
+      {name: "color", label: "Tab colour (#RRGGBB, optional)", placeholder: "#1565C0"},
+      {name: "talkgroup_ids", label: "Talkgroups, in channel order", type: "ordered", options: "talkgroups"},
+      {name: "notes", label: "Notes", type: "textarea", wide: true}],
+  })(el);
+  el.insertAdjacentHTML("afterbegin", `<div class="card" style="margin-bottom:16px"><p class="muted">Zones group talkgroups like a radio codeplug. PoC phones and dispatch consoles show the zones of their radio ID
+    (Subscriber Radios → Zones; none = all zones), each holding only the talkgroups that radio ID may use. The CSV export is a channel plan for programming radios.</p></div>`);
+  $("#zoneCsv", el).onclick = async e => {
+    e.preventDefault();
+    const r = await fetch("/api/zones/export.csv", {headers: {Authorization: "Bearer " + TOKEN}});
+    const url = URL.createObjectURL(await r.blob());
+    Object.assign(document.createElement("a"), {href: url, download: "keyup-zones.csv"}).click();
+    URL.revokeObjectURL(url);
+  };
+};
+
 pages.subscribers = async el => {
+  await options("zones");
   await resourcePage({
     path: "subscribers", title: "Subscriber",
     extraToolbar: `<button class="btn" id="importBtn">Import CSV</button>`,
     columns: [{key: "id", label: "Radio ID"}, {key: "alias", label: "Alias"}, {label: "Mode", render: r => pill(r.mode, "mode")}, {key: "model", label: "Model"},
       {key: "home_site_id", label: "Assigned site"}, {label: "Talkgroups", render: r => r.talkgroup_ids.length ? esc(r.talkgroup_ids.join(", ")) : '<span class="muted">all</span>'},
+      {label: "Zones", render: r => r.zone_ids.length ? esc(r.zone_ids.map(id => cache.zones?.find(z => z.id === id)?.name ?? id).join(", ")) : '<span class="muted">all</span>'},
+      {label: "PoC", render: r => yes(r.poc_enabled)},
       {label: "Last seen", render: r => r.last_seen ? `${ago(r.last_seen)} · site ${esc(r.last_site_id)} TG ${esc(r.last_tg_id ?? "")}` : "—"}, {label: "Enabled", render: r => yes(r.enabled)}],
     fields: [{name: "id", label: "Radio / unit ID", type: "number", required: true, readonly: true}, {name: "alias", label: "Alias", required: true},
       {name: "mode", label: "Mode", type: "select", options: MODES}, {name: "model", label: "Radio model"}, {name: "serial", label: "Serial"},
       {name: "home_site_id", label: "Assigned site / edge device", type: "select", options: "sites", nullable: true, numeric: true},
       {name: "talkgroup_ids", label: "Permitted talkgroups (none = all)", type: "multi", options: "talkgroups", wide: true},
+      {name: "zone_ids", label: "Zones (none = all zones)", type: "multi", options: "zones", wide: true},
       {name: "enabled", label: "Enabled (inhibit when off)", type: "bool", default: true}, {name: "notify_site_trunking", label: "Send site-trunking data alerts", type: "bool", default: true},
+      {name: "poc_enabled", label: "May use the PoC phone app", type: "bool"},
       {name: "notes", label: "Notes", type: "textarea", wide: true}],
   })(el);
   $("#importBtn", el).onclick = async () => {
@@ -434,7 +519,7 @@ pages.settings = async el => {
 };
 
 // ------------------------------------------------------------------ router
-const TITLES = {network: "Network", bandplan: "Band Plan", patches: "Talkgroup Patches", dashboard: "Dashboard", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
+const TITLES = {zones: "Zones", network: "Network", bandplan: "Band Plan", patches: "Talkgroup Patches", dashboard: "Dashboard", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
   subscribers: "Subscriber Radios", sip: "SIP Interconnect", calls: "Call History", settings: "System Settings"};
 async function route() {
   const page = (location.hash.slice(2).split("?")[0]) || "dashboard";

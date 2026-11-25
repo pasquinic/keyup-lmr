@@ -1,13 +1,15 @@
 """REST API for the management web UI, plus the public enrollment endpoints."""
 
+import csv
 import datetime as dt
+import io
 import json
 import secrets
 import threading
 import time
 from collections import Counter
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -16,9 +18,9 @@ from lmrcommon.modes import MODE_CODEC, MODE_LABELS, SystemMode
 from . import schemas as S
 from .config import settings
 from .db import get_db
-from .models import (BandPlanEntry, CallRecord, Channel, EdgeDevice, EnrollmentToken, SipRoute, Site, Subscriber,
-                     SystemSetting, TalkGroup, TalkgroupPatch, User, now)
+from .models import (BandPlanEntry, CallRecord, Channel, DispatchConsole, EdgeDevice, EnrollmentToken, PocDevice, SipRoute, Site, Subscriber, SystemSetting, TalkGroup, TalkgroupPatch, User, Zone, ZoneMember, now)
 from .services import rules
+from .services.zones import unit_view
 from .security import current_user, hash_secret, issue_token, verify_secret
 from .services.call_controller import get_system_settings
 from .services.events import bus
@@ -68,6 +70,11 @@ def _get_or_404(db, model, pk):
     return obj
 
 
+def _jsonable(data: dict) -> dict:
+    """dict values (e.g. a channel's packet_config) are stored as JSON text."""
+    return {k: json.dumps(v) if isinstance(v, dict) else v for k, v in data.items()}
+
+
 def crud(path: str, model, schema, order=None, pk_in_body=True):
     @router.get(f"/{path}", dependencies=admin, name=f"list_{path}")
     def list_(db: Session = Depends(get_db)):
@@ -78,7 +85,7 @@ def crud(path: str, model, schema, order=None, pk_in_body=True):
 
     @router.post(f"/{path}", dependencies=admin, name=f"create_{path}")
     async def create(body: schema, db: Session = Depends(get_db)):
-        data = body.model_dump()
+        data = _jsonable(body.model_dump())
         if pk_in_body and db.get(model, data["id"]):
             raise HTTPException(409, f"id {data['id']} already exists")
         obj = model(**data)
@@ -90,7 +97,7 @@ def crud(path: str, model, schema, order=None, pk_in_body=True):
     @router.put(f"/{path}/{{pk}}", dependencies=admin, name=f"update_{path}")
     async def update(pk: int, body: schema, db: Session = Depends(get_db)):
         obj = _get_or_404(db, model, pk)
-        for k, v in body.model_dump().items():
+        for k, v in _jsonable(body.model_dump()).items():
             if k != "id":
                 setattr(obj, k, v)
         db.commit()
@@ -122,10 +129,12 @@ def list_subscribers(db: Session = Depends(get_db)):
 def _apply_sub(db, sub: Subscriber, body: S.SubscriberIn):
     data = body.model_dump()
     tg_ids = data.pop("talkgroup_ids")
+    zone_ids = data.pop("zone_ids")
     for k, v in data.items():
         if k != "id" or sub.id is None:
             setattr(sub, k, v)
     sub.talkgroups = db.query(TalkGroup).filter(TalkGroup.id.in_(tg_ids)).all() if tg_ids else []
+    sub.zones = db.query(Zone).filter(Zone.id.in_(zone_ids)).all() if zone_ids else []
 
 
 @router.post("/subscribers", dependencies=admin)
@@ -467,3 +476,78 @@ def dashboard(db: Session = Depends(get_db)):
                       "server_ip": state.wg.server_ip, "endpoint": state.wg.endpoint,
                       "public_key": state.wg.public_key, "port": state.wg.port},
     }
+
+
+# ============================================================== zones
+def _apply_zone(db, z: Zone, body: S.ZoneIn) -> None:
+    data = body.model_dump()
+    ids = list(dict.fromkeys(data.pop("talkgroup_ids")))
+    known = {t.id for t in db.query(TalkGroup).filter(TalkGroup.id.in_(ids)).all()} if ids else set()
+    missing = [i for i in ids if i not in known]
+    if missing:
+        raise HTTPException(400, f"unknown talkgroup(s): {', '.join(map(str, missing))}")
+    for k, v in data.items():
+        setattr(z, k, v)
+    z.members = [ZoneMember(talkgroup_id=t, position=i) for i, t in enumerate(ids)]
+
+
+@router.get("/zones", dependencies=admin)
+def list_zones(db: Session = Depends(get_db)):
+    return [z.to_dict() for z in db.query(Zone).order_by(Zone.position, Zone.id).all()]
+
+
+@router.post("/zones", dependencies=admin)
+async def create_zone(body: S.ZoneIn, db: Session = Depends(get_db)):
+    z = Zone()
+    db.add(z)
+    _apply_zone(db, z, body)
+    db.commit()
+    await changed()
+    return z.to_dict()
+
+
+@router.put("/zones/{pk}", dependencies=admin)
+async def update_zone(pk: int, body: S.ZoneIn, db: Session = Depends(get_db)):
+    z = _get_or_404(db, Zone, pk)
+    z.members = []
+    db.flush()
+    _apply_zone(db, z, body)
+    db.commit()
+    await changed()
+    return z.to_dict()
+
+
+@router.delete("/zones/{pk}", dependencies=admin)
+async def delete_zone(pk: int, db: Session = Depends(get_db)):
+    db.delete(_get_or_404(db, Zone, pk))
+    db.commit()
+    await changed()
+    return {"ok": True}
+
+
+@router.get("/subscribers/{pk}/view", dependencies=admin)
+def subscriber_view(pk: int, poc: bool = False, db: Session = Depends(get_db)):
+    """The zones and talkgroups this radio ID gets (what a phone or console bound to it shows)."""
+    return unit_view(db, _get_or_404(db, Subscriber, pk), poc=poc)
+
+
+@router.get("/zones/export.csv", dependencies=admin)
+def export_zones(subscriber: int | None = None, db: Session = Depends(get_db)):
+    """Channel plan for programming radios: zone, position, channel name, talkgroup, priority."""
+    tgs = {t.id: t for t in db.query(TalkGroup).all()}
+    if subscriber:
+        view = unit_view(db, _get_or_404(db, Subscriber, subscriber))
+        zones = [(z["name"], z["talkgroups"]) for z in view["zones"]]
+    else:
+        zones = [(z.name, [m.talkgroup_id for m in z.members]) for z in db.query(Zone).order_by(Zone.position, Zone.id)]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["zone", "position", "channel_name", "talkgroup_id", "priority", "emergency"])
+    for name, ids in zones:
+        for i, t in enumerate(ids, 1):
+            tg = tgs.get(t)
+            if tg:
+                w.writerow([name, i, tg.name[:16], tg.id, tg.priority, "yes" if tg.emergency_enabled else "no"])
+    fname = f"keyup-zones{'-' + str(subscriber) if subscriber else ''}.csv"
+    return Response(buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})

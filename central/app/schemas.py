@@ -38,6 +38,8 @@ class TalkGroupIn(BaseModel):
     parrot: bool = False
     site_ids: str = Field("", pattern=r"^[0-9, ]*$")
     sip_extension: str = ""
+    allow_poc: bool = True
+    record: bool = True
     enabled: bool = True
 
 
@@ -68,6 +70,9 @@ class ChannelIn(BaseModel):
     signaling: Literal["gpio", "serial"] = "gpio"
     serial_port: str = ""
     cor_invert: bool = False
+    interface: Literal["radio", "dfsi", "ipsc", "capplus"] = "radio"
+    packet_config: dict = {}
+    extra_talkgroups: str = Field("", pattern=r"^(\*|[0-9, ]*)$")
     enabled: bool = True
 
 
@@ -82,6 +87,34 @@ class SubscriberIn(BaseModel):
     notify_site_trunking: bool = True
     notes: str = ""
     talkgroup_ids: list[int] = []
+    zone_ids: list[int] = []
+    poc_enabled: bool = False
+
+
+class ZoneIn(BaseModel):
+    name: str = Field(min_length=1, max_length=32)
+    position: int = 0
+    color: str = Field("", pattern=r"^(#[0-9A-Fa-f]{6})?$")
+    notes: str = ""
+    talkgroup_ids: list[int] = []
+
+
+class ConsoleIn(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    subscriber_id: int
+    zone_ids: list[int] = []
+    can_inhibit: bool = True
+    call_priority: bool = True
+    can_patch: bool = True
+    enabled: bool = True
+    notes: str = ""
+
+
+class ActivateIn(BaseModel):
+    code: str
+    platform: str = ""
+    app: str = ""
+    name: str = ""
 
 
 class SipRouteIn(BaseModel):
