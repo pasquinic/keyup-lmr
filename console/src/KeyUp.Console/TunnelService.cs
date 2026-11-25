@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 using System.Diagnostics;
+using System.IO;
 using System.ServiceProcess;
 using System.Text.Json;
 using KeyUp.Console.Core;
