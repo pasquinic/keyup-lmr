@@ -6,7 +6,7 @@
 # never be used for public safety or life safety; KeyUp won't start it until you acknowledge that.
 FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates cmake g++ make libasio-dev libncurses-dev libssl-dev \
+      ca-certificates cmake g++ git make libasio-dev libncurses-dev libssl-dev \
  && rm -rf /var/lib/apt/lists/*
 COPY dvm/dvmhost /src
 RUN rm -rf /src/build && mkdir /src/build && cd /src/build \

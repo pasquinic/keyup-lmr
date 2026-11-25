@@ -29,7 +29,7 @@ apt-get install -y -qq python3-lgpio 2>/dev/null || true   # Pi 5 / Bookworm GPI
 
 if [[ $WITH_DVM -eq 1 ]] && ! command -v dvmhost >/dev/null; then
   echo "==> building the KeyUp DVM fork (dvmhost/dvmbridge) from $SERVER (20-40 min on a Pi 4)"
-  apt-get install -y -qq cmake g++ make libasio-dev libncurses-dev libssl-dev
+  apt-get install -y -qq cmake g++ git make libasio-dev libncurses-dev libssl-dev
   rm -rf /opt/keyup-dvm && mkdir -p /opt/keyup-dvm
   curl -fsSL "$SERVER/edge/dvm-src.tar.gz" | tar -xz -C /opt/keyup-dvm
   mkdir -p /opt/keyup-dvm/dvmhost/build && cd /opt/keyup-dvm/dvmhost/build

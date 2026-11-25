@@ -3,7 +3,7 @@
 # Bare-metal install.sh is equivalent and gives the lowest audio latency.
 FROM debian:bookworm-slim AS dvm
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates cmake g++ make libasio-dev libncurses-dev libssl-dev \
+      ca-certificates cmake g++ git make libasio-dev libncurses-dev libssl-dev \
  && rm -rf /var/lib/apt/lists/*
 COPY dvm/dvmhost /src
 RUN rm -rf /src/build && mkdir /src/build && cd /src/build \
