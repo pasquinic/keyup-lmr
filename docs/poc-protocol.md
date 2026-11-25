@@ -18,14 +18,14 @@ JSON text frames:
 | Direction | Message | Meaning |
 |---|---|---|
 | → | `{"t":"auth","token","app","platform"}` | First message |
-| ← | `auth_ok` / `profile` `{unit, system, talkgroups[], selected, scan, scan_on, network}` | Permitted talkgroups only. `profile` is re-sent when the admin changes something |
+| ← | `auth_ok` / `profile` `{unit, system, talkgroups[], zones[], selected, scan, scan_on, network}` | Permitted talkgroups only. `zones` is `[{id, name, talkgroups:[tg,…]}]` in the radio's zone order; talkgroups not in any of its zones appear in an "Other" zone. `profile` is re-sent when the admin changes something |
 | ← | `auth_fail {reason}` / `inhibited {reason}` | The connection is then closed (`invalid_token`, `device_revoked`, `inhibited`, `poc_disabled`, …) |
 | → | `{"t":"select","tg","scan":[..],"scan_on"}` | Selected talkgroup, plus the scan list (up to 16) |
 | → | `{"t":"ptt","on":true,"tg","emergency"}` / `{"t":"ptt","on":false}` | Push-to-talk |
 | ← | `grant {tg}` / `deny {tg, reason}` / `tx_end {tg, reason}` | Deny reasons: `busy`, `not_permitted`, `network_down`, `no_interconnect`. `tx_end` reasons: `timeout` and others |
 | ← | `rx_start {tg, tg_name, src, alias, emergency}` / `rx_end {tg}` | Who is talking. The selected talkgroup has priority over scanned ones |
 | ↔ | `emergency {tg, on}` | Declare or clear an emergency. It is broadcast to everyone on the talkgroup and raises the console alarm |
-| ← | `status {network}` | Radio network (FNE) up or down |
+| ← | `status {network}` | Radio network up or down (at least one edge or packet site connected) |
 | → / ← | `ping {ts}` / `pong {ts, network}` | Every 5 s. After 20 s with no pong, the client reconnects |
 
 Binary frames carry audio as 20 ms frames of G.711 μ-law at 8 kHz:
@@ -36,16 +36,17 @@ The link is half duplex, like a radio. Received audio is muted while transmittin
 
 ## How the server handles it
 
-`central/app/services/poc.py` with `tg_audio.py`:
+`central/app/services/poc.py`. Each connected phone is a leg of KeyUp's own call router (`call_controller.py`), exactly like an edge site, a SIP call or a dispatch console:
 
-- **Interconnect bridge:** each talkgroup a PoC user may select gets one `dvmbridge`, called `ic-tg<N>`. It exchanges raw PCM with KeyUp over localhost UDP as `[len][pcm][dstId][srcId]`, with `overrideSourceIdFromUDP` enabled.
-- **Radio ID on the FNE:** a phone's call reaches the FNE **with the phone's radio ID**. The FNE therefore applies `rid_acl`, `rid_permitted` and unknown-radio-ID rejection exactly as it does for RF radios.
-- **Floor control:** one local talker per talkgroup. A talkgroup is busy while radio traffic is playing out or the FNE reports an active call on it. An emergency key-up can take the local floor.
-- **Jitter buffer:** 60 ms, paced at 20 ms. If the uplink stalls while PTT is held, silence is sent so the call doesn't drop.
 - **Same rules as a radio:**
-  - only permitted talkgroups;
+  - only permitted talkgroups (and `allow_poc` on the talkgroup);
   - restricted talkgroups only if the radio ID lists them;
+  - talkgroup patches, allowed sites and affiliated-only routing apply as for RF;
   - the system maximum call time;
-  - inhibit (disabling the Subscriber) logs the phone out within one save;
+  - inhibit (or disabling PoC on the Subscriber) logs the phone out within one save;
   - last-seen talkgroup and time are updated.
-- **Phone to phone:** the FNE never echoes a call back to the peer it came from, so other phones on the same talkgroup get the talker's audio locally from the hub.
+- **Floor control:** the router's normal floor per talkgroup. A key-up while the talkgroup is busy gets `deny busy`; an emergency key-up preempts a lower-priority call.
+- **Audio:** μ-law from the phone becomes codec-tagged voice frames in the router. The transcoder converts to each destination's codec (G.711 pass-through, or IMBE/AMBE+2 through the DVSI pool). Downlink audio to a phone is always μ-law.
+- **Jitter buffer:** 60 ms, paced at 20 ms. If the uplink stalls while PTT is held, silence is sent so the call doesn't drop.
+- **Phone to phone:** routed by the router like any other leg; the talker never hears itself.
+- **Recording:** PoC calls are recorded and logged like any other call when the talkgroup has recording on.

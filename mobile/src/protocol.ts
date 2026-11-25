@@ -104,7 +104,6 @@ export const DENY_TEXT: Record<string, string> = {
   invalid_token: 'Activation no longer valid',
   poc_disabled: 'PoC disabled for this radio ID',
   system_not_ready: 'System not ready',
-  poc_requires_dvm_backend: 'Server not configured for PoC',
 };
 
 /** Parse keyup://activate?s=<server>&u=<unit>&c=<code> (QR code / deep link). */

@@ -2,17 +2,24 @@ KeyUp — distributed LMR trunking
 Copyright (C) 2026 KeyUp contributors
 
 KeyUp is free software, licensed under the GNU General Public License version 2
-(see LICENSE). It includes a modified copy (fork) of DVMProject's dvmhost in
-dvm/dvmhost/, which is GPL-2.0 and remains under the copyright of its authors
-(see the headers in each source file and dvm/FORK.md).
+(see LICENSE).
 
-The Windows dispatch console in console/ is a fork of DVMProject's dvmconsole and
-fnecore, licensed under the GNU Affero General Public License version 3
-(console/LICENSE), with dvmvocoder (GPL-2.0) in console/dvmvocoder/. It is a
-separate program that talks to KeyUp and the FNE over the network; see
-console/FORK.md.
+KeyUp is an independent implementation. Earlier history in this repository
+contains a DVMProject-based branch; the current code does not include or link to
+any DVMProject source. Published DVMProject documentation was used only as a
+reference for features and behaviour.
 
-DVMProject's usage guidelines (dvm/dvmhost/usage_guidelines.md) state that the
-software is not designed, tested, certified or supported for public safety or
-life safety use. KeyUp follows that: it is for personal, non-commercial use, and
-it does not start DVM until the operator acknowledges this in the web UI.
+The DFSI, IP Site Connect and Capacity Plus support is written from public
+descriptions of those interfaces. It is not affiliated with, endorsed by or
+certified by Motorola Solutions or any other vendor. P25, DMR and NXDN names are
+used only to describe interoperability.
+
+The Windows dispatch console (console/) is KeyUp's own code under GPL-2.0. Its
+installer bundles wireguard.dll from WireGuardNT (https://git.zx2c4.com/wireguard-nt),
+unmodified, under that project's own license, which is shipped alongside it.
+"WireGuard" is a registered trademark of Jason A. Donenfeld.
+
+IMBE and AMBE+2 are proprietary DVSI vocoders. KeyUp contains no software
+implementation of them; it drives licensed DVSI AMBE-3000 hardware.
+
+KeyUp is not designed, tested or certified for public safety or life safety use.

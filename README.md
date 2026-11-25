@@ -2,108 +2,82 @@
 
 **Distributed LMR trunking. Key up anywhere.**
 
-KeyUp is a trunked land-mobile-radio system for a personal network. It has three parts in one repository:
-
-| Part | Where | What it is |
-|---|---|---|
-| **Central + edges** | `central/`, `edge/`, `lmrcommon/` | Web management, WireGuard hub, enrollment, config compiler, SIP interconnect and dashboard; Raspberry Pi edge agent with site trunking |
-| **KeyUp DVM fork** | `dvm/dvmhost/` | A maintained fork of [DVMProject/dvmhost](https://github.com/DVMProject/dvmhost): `dvmfne`, `dvmhost`, `dvmbridge`, `dvmcmd` (P25 Phase I, DMR, NXDN, analog) |
-| **KeyUp PoC app** | `mobile/` | Android and iOS push-to-talk app; each phone is a subscriber radio with the same rules as an RF radio |
-| **KeyUp Dispatch Console** | `console/` | Windows dispatch console, a fork of [DVMProject/dvmconsole](https://github.com/DVMProject/dvmconsole): joins the FNE as its own peer over WireGuard and transmits as a radio ID |
-
-Two call backends are available, chosen in **System Settings → `call_backend`**:
-
-- **`dvm`** (default): the KeyUp DVM fork carries the traffic. KeyUp compiles your configuration into DVM's config files and supervises the daemons.
-- **`native`**: KeyUp's own Python router carries the traffic between edges, for analog or lab setups without DVM modems. Talkgroup rules, patches, band plan, CW ID and serial interfaces work in both.
-
-> **Use restrictions (from DVMProject):** DVM is for personal, non-commercial, hobbyist use only. It must never be used in public safety or life safety critical applications. KeyUp does not start any DVM process until you acknowledge this on the **DVM Network** page, which sets DVM's `iAgreeNotToBeStupid` flag. The fork keeps this flag and DVM's other safeguards unchanged.
+KeyUp is an independent, self-hosted LMR network. Raspberry Pi edges connect base station radios, or packet-voice repeaters, to a central call router over WireGuard. Dispatchers use a Windows console, field users can talk from a phone over cellular, and every call can be logged, recorded and shipped to a second server.
 
 ```
-                    ┌───────────────────────── Central (Ubuntu Server, Docker) ─────────────────────────┐
- Browser ─HTTPS─► Caddy ─► KeyUp central (FastAPI + Postgres)                                           │
-                    │        ├─ web UI: sites, channels, band plan, talkgroups, radios, patches, SIP      │
-                    │        ├─ compiles the DB into DVM configs ──► ./data/dvm/instances/*             │
-                    │        ├─ FNE monitor: REST (peers, affiliations) + log tail (live calls, history)  │
-                    │        ├─ WireGuard hub + device enrollment, edge control link                     │
-                    │        └─ SIP gateway (DTMF/VOX floor) ◄─RTP─► per-TG dvmbridge                    │
-                    │      dvm container: supervisor ─► dvmfne · dvmbridge (SIP TGs) · dvmbridge pairs   │
-                    │                                    (cross-mode patches, e.g. DMR TG1 ⇄ P25 TG100)  │
-                    │      Asterisk (PJSIP + ARI) ◄─SIP─► phones / PBX / carrier                          │
-                    └───────────────────────────────▲────────────────────────────────────────────────────┘
-                                 WireGuard tunnel   │  DVM peer link (UDP 62031) + KeyUp control link
-              ┌─────────────────────────────────────┴──────────┐
-              │ Edge: Raspberry Pi  (lmr-edge agent)           │   one per site
-              │   pulls its site's DVM configs from central    │
-              │   supervises dvmhost per RF channel            │──► DVM-V1 / hotspot modem ─► repeater
-              │            dvmbridge per analog radio          │──► sound card + serial RTS/CTS ─► radio
-              │   reports health; caches config for outages    │
-              └────────────────────────────────────────────────┘
+                ┌──────────────────────── Central (Ubuntu Server, Docker) ────────────────────────┐
+ Browser ─HTTPS─► Caddy ─► central (FastAPI)                                                       │
+ Phone (PoC) ───WSS──────►   ├─ Web UI + REST API + live feed                                      │
+ Console ─WG or WSS──────►   ├─ Call router: floor, priority/emergency preemption, hang time,      │
+                │            │   patches, zones, site limits, affiliation                          │
+                │            ├─ Transcoder (G.711 ⇄ IMBE ⇄ AMBE+2, DVSI AMBE-3000 pool)            │
+                │            ├─ Recorder + shipper (HTTPS / SIP / SIPREC)                          │
+                │            ├─ WireGuard hub (wg-lmr) for edges and consoles                      │
+                │            └─ SIP gateway ◄─ARI─► Asterisk                                       │
+                │          PostgreSQL                                                              │
+                └─────────────────▲─────────────────────────────────▲──────────────────────────────┘
+                                  │ WireGuard (control WS + voice UDP)
+                ┌─────────────────┴──────────────┐         ┌────────┴───────────────────────────┐
+                │ Edge (Raspberry Pi)            │         │ Edge (Raspberry Pi)                │
+                │  audio + COR/PTT radios        │   …     │  packet channels:                  │
+                │  optional DVSI USB vocoder     │         │  DFSI · IP Site Connect · Cap+     │
+                │  site trunking if central down │         │                                    │
+                └──┬──────────┬──────────────────┘         └──┬───────────────┬─────────────────┘
+               Base radio  Base radio (P25/DMR/NXDN/analog)  P25 station    MOTOTRBO repeaters
 ```
 
-## The KeyUp DVM fork
+All code in this repository is KeyUp's own. DVMProject's published documentation was used as a feature reference only; no DVM code is included or required.
 
-`dvm/dvmhost/` is DVMProject's dvmhost source at upstream commit `435ff45`, vendored into this repository and built by KeyUp's Dockerfiles, the Pi installer and CI. KeyUp's changes are small and marked `// KeyUp fork`:
+## What is implemented
 
-- **Structured call events:** when the FNE runs with `KEYUP_EVENTS_FILE` set, every P25, DMR, NXDN and analog call start and end is appended as a JSON line (source, destination, peer, duration, stream). KeyUp's FNE monitor reads this feed instead of parsing log text; the **DVM Network** page shows `event feed: keyup-fork`. Upstream DVM binaries still work through the log-parse fallback.
-- **Version tag:** binaries report `… keyup.1`. The network protocol version is unchanged, so the fork interoperates with upstream DVM peers.
+**Call router** (`central/app/services/call_controller.py`)
+- Every participant is a leg of one router: edge channels, packet channels, SIP calls, PoC phones and dispatch consoles.
+- Floor control per talkgroup, with a busy reply. Priority preemption; emergency calls take priority.
+- Hang time with talkback, maximum call time, radio ID permission checks, heartbeat supervision.
+- Codec-tagged voice frames. P25 Phase II, DMR and NXDN share AMBE+2 and pass straight through. IMBE, G.711 and SIP go through PCM using the DVSI vocoder pool. Each frame is decoded once and encoded once per destination codec.
 
-`dvm/FORK.md` lists every change and how to sync with upstream. The central server serves the fork source to edges at `/edge/dvm-src.tar.gz`, so every site builds the same code.
+**Zones**
+- A zone is an ordered list of talkgroups. Assign zones to subscriber radios and to dispatch consoles.
+- Phones show a zone knob and a talkgroup list grouped by zone. Consoles show one tab per zone.
+- Zones can be exported as CSV for programming radios.
 
-## How the pieces map
+**Dispatch with the Windows console** (`console/`, see `console/README.md`)
+- A native Windows app (C#, .NET 8, WPF), one tab per zone and a tile per talkgroup: monitor with per-tile volume, select, per-tile PTT plus a PTT key, who-is-talking, emergency banner with acknowledge / clear, radio inhibit / uninhibit, talkgroup patches, and a call and event log.
+- **WireGuard is built in.** Activation gives the console its own tunnel, run by a small Windows service (the **KeyUp Tunnel** service) using the official WireGuardNT driver, so no separate WireGuard install is needed and the console itself runs without administrator rights. If the tunnel isn't up, it falls back to HTTPS.
+- Activated with a one-time code from **Dispatch Consoles** in the web UI. Secrets are stored with Windows DPAPI.
+- Installer and portable zip are built by GitHub Actions (**Console · Windows build** workflow).
 
-| You configure in KeyUp | KeyUp generates for DVM |
-|---|---|
-| Sites (number, RFSS, callsign, location) | `system.config.siteId` / `rfssId`, CW ID and info in each `dvmhost` config |
-| Band plan entries | `iden_table.dat`. Each channel's TX frequency becomes a `channelId` and `channelNo`, and the RX offset is checked |
-| Channels: P25 Phase I / DMR / NXDN, *control* or *voice* role, modem port, levels | One `dvmhost` per channel, with a peer ID and password. A site with a control-role channel becomes a **trunked site**: the CC lists its voice channels, and the voice channels notify the CC over RPC |
-| Analog channels | One `dvmbridge` per radio: local audio, plus serial RTS for PTT and CTS for COR. It speaks the talkgroup's mode |
-| Talkgroups (slot, affiliated-only, restricted, parrot, site limits) | `talkgroup_rules.yml`: `rid_permitted`, `inclusion`, `affiliated`, `parrot` |
-| Subscriber radios (enabled, permitted TGs) | `rid_acl.dat`; optionally reject unknown radio IDs |
-| Edge devices and channels | `peer_list.dat`: the FNE only accepts peers KeyUp knows about |
-| Control channels across sites | `adj_site_map.yml`, so radios can roam between neighbor sites |
-| SIP-enabled talkgroups, and talkgroups PoC phones may use | One interconnect `dvmbridge` per talkgroup (raw PCM over UDP, with the source radio ID in metadata), shared by the SIP gateway and the PoC gateway |
-| Cross-mode patches | Two `dvmbridge`s connected back to back, which re-vocode, for example DMR ⇄ P25 |
+**PoC terminals for cellular push to talk** (`mobile/`, protocol in `docs/poc-protocol.md`)
+- iOS / Android app (Expo / React Native). Activated by QR code from **Subscriber Radios → PoC QR**.
+- A phone is a subscriber radio: same radio ID, permissions, zones, inhibit and emergency as RF.
+- Scan list, emergency, and per-device revoke under **PoC Phones**.
 
-Saving anything in the UI regenerates these files. The FNE hot-reloads lookup changes through its REST API, and the supervisors restart a daemon only if its main config changed. Each site's files are pushed to its edge over the tunnel.
+**Talkgroup logging and audio recording**
+- Every call is logged: talkgroup, source, all talkers with times, sites, duration, emergency flag, end reason.
+- Talkgroups with **Record** on are recorded on the central server as μ-law with real-time gaps preserved. Without a vocoder, native IMBE / AMBE+2 frames are kept raw instead.
+- **Call History & Recordings** page: filters, an audio player, CSV export, and per-call ship status with retry.
+- Retention by days and by total size (System Settings).
+- **Shipping to a second server** (System Settings → Recording):
+  - `https`: POST the WAV plus JSON metadata to a URL, with a bearer token;
+  - `sip`: place a SIP call to the recorder and play the call audio over RTP;
+  - `siprec`: SIP with RFC 7865 recording metadata (talkgroup, talkers, times), for SIPREC recorders.
+  - Shipping has a queue and retries. SIP uses KeyUp's own UA over UDP or TCP, with digest authentication.
 
-**Site trunking** is handled by DVM itself. When a site's `dvmhost` loses the FNE, it keeps repeating locally and clears the *network active* flag in its P25 (and NXDN/DMR) site broadcasts, so trunked subscriber radios show **SITE TRUNKING**. `updateLookups` and `saveLookups` are enabled, so the site keeps the last talkgroup and radio ID lists. The KeyUp edge agent detects the lost FNE link, reports the site as site trunking on the dashboard, and can drive a GPIO indicator or webhook.
+**Packetized voice** (channel **Interface** on the Channels page)
+- **DFSI** (P25 fixed station interface over UDP/RTP): IMBE voice with link control and encryption sync, heartbeat and connect / disconnect.
+- **IP Site Connect**: the edge joins MOTOTRBO repeaters as a master or a peer, with authentication, on one or both timeslots. AMBE+2 voice with LC.
+- **Capacity Plus**: the edge joins the system as a peer and carries the talkgroups listed in **Extra talkgroups** (or `*` for all).
+- A packet channel is configured with `packet_config` (local port, remote host / port, peer ID, auth key, timeslots). The router sends each packet site its native codec, so DMR ⇄ NXDN ⇄ P25 Phase II need no vocoder.
 
-## PoC phones: cellular subscriber radios
+**Edge** (`edge/`, Raspberry Pi)
+- Zero-touch install with a one-time token; WireGuard set up automatically.
+- Audio radios: COR in / PTT out by GPIO or serial RTS/CTS, USB sound cards, TX delay / tail, CW ID.
+- Optional DVSI USB-3000 / ThumbDV for native IMBE / AMBE+2 on the network.
+- **Site trunking** when central is unreachable: local repeat, data messages and alert tones to radios, and upload of the local call log on recovery.
 
-The **KeyUp PoC** app (`mobile/`, one React Native / Expo codebase for Android and iOS) makes a phone a subscriber radio over cellular or Wi-Fi. The phone uses a radio ID from **Subscriber Radios** and is held to the same rules as an RF radio:
-- **Permitted talkgroups:** only those the radio ID is allowed on; restricted talkgroups only if the ID lists them.
-- **Inhibit:** disabling the Subscriber logs the phone out at once.
-- **Radio ID rules on the FNE:** the phone's transmissions reach the FNE carrying its own radio ID, through a per-talkgroup interconnect `dvmbridge`, so the FNE's radio ID lists and permitted-ID checks apply.
-- **Busy and timeout:** busy rules and the system's maximum call time apply.
-- **Emergencies:** raise the dispatcher alarm.
-
-To provision a phone, press **PoC QR** on a subscriber, then scan the QR code in the app. Phones are managed on the **PoC Phones** page. Details are in `mobile/README.md` and `docs/poc-protocol.md`.
-
-### Building the apps
-
-| Build | How | Output |
-|---|---|---|
-| Windows dispatch console | GitHub Actions **Console · Windows build** (on every push to `console/`; tag `console-vX.Y.Z` to publish a Release) | `KeyUp-Dispatch-Console-win-x86.zip` (self-contained, includes `libvocoder.dll`) |
-| Android APK | GitHub Actions **Mobile · Android build** (on every push to `mobile/`, or run manually) | `KeyUp-PoC.apk` artifact; signed with your key if the `ANDROID_KEYSTORE_*` secrets are set, otherwise debug-signed for side-loading |
-| iOS Simulator | GitHub Actions **Mobile · iOS build** (macOS runner) | `KeyUp-PoC-simulator.zip` artifact |
-| Signed iOS + Android | GitHub Actions **Mobile · EAS build** (manual; needs an `EXPO_TOKEN` secret) or `npx eas-cli build` | Installable IPA/APK, or store bundles with the `production` profile |
-| Local | `cd mobile && npx expo run:android` / `npx expo run:ios` | Debug build on a connected device |
-
-Installing on iPhones requires an Apple Developer account; EAS handles the certificates. One-time EAS setup is in `mobile/README.md`.
-
-## Dispatch consoles (Windows)
-
-The **KeyUp Dispatch Console** (`console/`) puts dispatch on a Windows PC. It's KeyUp's fork of DVMProject's desktop console, so it has a channel grid, PTT, paging, radio check, inhibit and call history. KeyUp provisions it:
-- **Dispatch Consoles** page: pick the radio ID the console transmits as, optionally narrow its talkgroups, and choose whether it may inhibit radios and has call priority.
-- **Activate** gives a one-time code. In the console, **File → Connect to KeyUp Server** trades it for the console's codeplug, radio aliases and a WireGuard tunnel file for WireGuard for Windows.
-- On the FNE, the console is its own peer (`9300000 +` console number) with its own password. It's on the always-send list for its talkgroups, so it hears them even when they are "affiliated only".
-- Talkgroup and alias changes reach the console on its next start, or with **File → Sync with KeyUp**. **Revoke** cuts it off.
-
-Download `KeyUp-Dispatch-Console-win-x86.zip` from the repository's Releases (or the **Console · Windows build** Actions run). Unzip it and run `DVMConsole.exe`; no install or .NET is needed. Details are in `console/README.md`.
+**SIP interconnect** through Asterisk (ARI + external media): inbound by extension, outbound and permanent patches.
 
 ## System rules and network tools
-
-With the **native** backend these are enforced by KeyUp's own router. With the **DVM** backend the same settings compile into the FNE's `talkgroup_rules.yml`, `iden_table.dat` and bridge pairs, so you configure them once either way.
 
 - **Band plan:** define channel identities (base frequency, spacing, input offset). The frequency plan then shows each channel's identity and channel number, and flags transmit frequencies that are off-plan or have the wrong receive offset.
 - **Talkgroup rules:**
@@ -125,75 +99,107 @@ With the **native** backend these are enforced by KeyUp's own router. With the *
 ```bash
 sudo apt install -y docker.io docker-compose-v2 wireguard
 git clone https://github.com/pasquinic/keyup-lmr.git && cd keyup-lmr
-cp .env.example .env && nano .env             # hostname, passwords, WG_ENDPOINT, FNE_REST_PASSWORD
-docker compose up -d --build                  # db + central + dvm (FNE) + caddy
-docker compose --profile sip up -d            # optional Asterisk (set ARI_ENABLED=true)
+cp .env.example .env && nano .env        # hostname, passwords, WG_ENDPOINT
+docker compose up -d --build             # db + central + caddy
+docker compose --profile sip up -d       # optional: Asterisk SIP (set ARI_ENABLED=true)
 
-sudo ufw allow 80,443/tcp && sudo ufw allow 51820/udp
+# firewall
+sudo ufw allow 80,443/tcp
+sudo ufw allow 51820/udp
 sudo ufw allow in on wg-lmr to any port 8080,50000 proto tcp
-sudo ufw allow in on wg-lmr to any port 62031 proto udp       # DVM peers (edges, consoles) only inside the tunnel
+sudo ufw allow in on wg-lmr to any port 50000 proto udp
+sudo ufw allow 5060/udp && sudo ufw allow 10000:10999/udp   # only if SIP is exposed
 sudo ufw enable
 ```
 
-Then, in the UI:
-1. Go to **DVM Network** and acknowledge the license.
-2. Set up the system in this order: **Band Plan → Sites → Talkgroups → Channels → Subscriber Radios**.
-   To run without DVM modems, set **System Settings → `call_backend` = `native`** instead.
-3. Under **Edge Devices**, generate an enrollment token.
+Open `https://<PUBLIC_HOSTNAME>`, sign in with `ADMIN_USER` / `ADMIN_PASSWORD` and change the password under System Settings. Then set up the system in this order: **Sites → Talkgroups → Zones → Channels → Subscriber radios → Edge Devices (generate a token) → PoC Phones / Dispatch Consoles**.
+
+**Updating an existing install** (including one that ran the DVMProject-based build):
+
+```bash
+git pull && docker compose up -d --build --remove-orphans
+```
+
+`--remove-orphans` removes the old `dvm` container. The database is upgraded in place on start: new columns are added, and the DVM-era band plan and patches are copied into the native tables.
+
+**Firewall additions for the new features:** PoC phones and the console's HTTPS mode use port 443 only. Consoles in WireGuard mode use UDP 51820 like the edges. If recordings are shipped over SIP, allow the recorder's SIP and RTP traffic outbound.
+
+Recordings are stored under `./data/recordings/` on the host.
 
 ## Deploy an edge (Raspberry Pi 4/5, Raspberry Pi OS Bookworm 64-bit)
+
+Copy the install command shown when you generate a token, and run it on the Pi:
 
 ```bash
 curl -fsSL https://lmr.example.com/edge/install.sh | sudo bash -s -- --server https://lmr.example.com --token <TOKEN>
 ```
 
-The installer:
-- downloads the KeyUp DVM fork source from your central server and builds `dvmhost`, `dvmbridge` and `dvmcmd` (about 20–40 minutes on a Pi 4);
-- installs the agent;
-- enrolls the Pi;
-- brings up WireGuard.
+If the token is not auto-approve, approve the device on the Edge Devices page. To run the edge as a container instead, use `edge/docker-compose.yml`. Bare metal gives the lowest audio latency.
 
-Add `--gpio-modem` if a DVM modem HAT uses the Pi's UART. A USB modem shows up as `/dev/ttyACM0`. A container build is in `edge/Dockerfile`.
+**Wiring for each base radio** (one channel = one radio = one USB sound card):
 
-You set each channel's modem in the UI:
-- **UART + air** for a DVM-V1 or hotspot;
-- **UART + DFSI** for a Motorola V.24 station through a DVM-V24;
-- **Null** for lab testing without RF.
+| Signal | Pi side | Radio side |
+|---|---|---|
+| RX audio | USB sound card mic/line in | Discriminator or line out (accessory port) |
+| TX audio | USB sound card out | Mic / line in |
+| COR/COS | GPIO input (BCM, default 27), through an opto-isolator | Carrier/squelch detect |
+| PTT | GPIO output (BCM, default 17) → transistor/opto | PTT line |
 
-## Tests
+With a USB radio interface cable you can use **serial signalling** instead: RTS drives PTT and CTS reads COR.
+
+Set `audio_device` to an ALSA `plughw:` device so ALSA resamples to 8 kHz. Pins and sound cards are configured per channel in the web UI.
+
+**Packet channels** need no audio wiring. Put the edge on the same LAN as the station or repeaters, set the channel's **Interface** to DFSI, IPSC or Cap+, and fill in its packet settings. The edge then speaks that protocol on UDP.
+
+## Dispatch console
+
+1. Download the console from GitHub → **Actions → Console · Windows build** → latest run → **Artifacts** (installer or portable zip), and run the setup. It installs the console and the KeyUp Tunnel service (administrator rights are asked for once).
+2. In the web UI, open **Dispatch Consoles**, add a console (its radio ID and zones) and press **Activate**.
+3. Start the console, choose **Connect to KeyUp…**, and enter the server address and the code. The header shows whether it is on WireGuard or HTTPS.
+
+More in `console/README.md`.
+
+## Test without hardware
 
 ```bash
-pip install -r central/requirements.txt -r edge/requirements.txt pytest pyyaml
-PYTHONPATH=.:central pytest -q tests        # unit tests (config compiler, rules, supervisor)
-python3 tests/lab_e2e.py                     # native backend: edges, routing, site trunking
-python3 tests/lab_rules_e2e.py               # native backend: talkgroup rules, patches, CW ID, band plan
-
-# DVM backend against the fork's binaries
-(mkdir -p dvm/dvmhost/build && cd dvm/dvmhost/build && cmake .. -DENABLE_TUI_SUPPORT=off && make -j4 dvmfne dvmhost dvmbridge dvmcmd)
-(cd mobile && npm ci --legacy-peer-deps)
-DVM_BIN_DIR=$PWD/dvm/dvmhost/build python3 tests/lab_dvm_e2e.py
-
-cd mobile && npm run typecheck && npx eslint src && npm test   # app
+pip install -r central/requirements.txt -r edge/requirements.txt pytest
+PYTHONPATH=.:central pytest -q tests            # protocol, G.711, DVSI framing, zones, recording, DFSI/IPSC codecs
+python3 tests/lab_e2e.py                        # central + 2 simulated sites, full scenario incl. site trunking
+python3 tests/lab_rules_e2e.py                  # patches, site limits, parrot, affiliated-only, restricted, CW ID
+python3 tests/lab_features_e2e.py               # zones, PoC, recording + SIP/SIPREC/HTTPS shipping, dispatch console
+python3 tests/lab_packet_e2e.py                 # DFSI, IP Site Connect and Capacity Plus against simulators
 ```
 
-`lab_dvm_e2e.py` runs KeyUp, `dvmfne`, three `dvmbridge`s and two edges supervising three `dvmhost`s, all on one machine. It checks that:
-- every generated config is accepted and the P25 voice channel attaches to its control channel;
-- SIP audio becomes a P25 call that KeyUp records, and the patch re-vocodes it onto DMR;
-- PoC phones transmit with their own radio ID, hear radio traffic, get busy and not-permitted denials, and are cut off when inhibited; the app's TypeScript client keys up against the live server;
-- the dispatch console's own network code (built headless from `console/tests/PeerCheck`, needs the .NET 8 SDK) activates, logs into the FNE as its peer, transmits P25 as its radio ID, hears radio traffic, leaves out restricted talkgroups, re-syncs and is revoked;
-- the fork's structured call-event feed is active;
-- an FNE outage puts both sites into site trunking, and they return to wide area afterwards.
+The labs use simulators in `tools/`: a pty AMBE-3000 stand-in, DFSI and IPSC stations, a SIP recorder, and PoC and console clients. `lab_features_e2e.py` also runs the console's C# core against the server when the .NET SDK is installed. All of these run in CI.
 
-GitHub Actions (`.github/workflows/ci.yml`) runs all of these on every push.
+## Repository layout
 
-## Notes and limitations
+```
+lmrcommon/        shared: voice frames, modes/codecs, G.711, DVSI driver + pool, DFSI, IPSC, P25 Reed-Solomon
+central/app/      FastAPI server: models, API, call router, transcoder, zones, PoC, dispatch, recorder,
+                  shipper, SIP UA, WireGuard, SIP gateway, web UI
+edge/lmr_edge/    Pi agent: enrollment, links, GPIO/ALSA and serial radios, packet channels, site trunking
+console/          Windows dispatch console (C#/.NET 8), tunnel service, Inno Setup installer
+mobile/           PoC app (Expo / React Native)
+asterisk/         Asterisk container + PJSIP/ARI config
+deploy/Caddyfile  TLS reverse proxy
+tools/            simulators and test clients
+tests/            unit tests + end-to-end labs
+docs/             PoC protocol
+```
 
-- **Modes:** DVM supports P25 Phase I, DMR and NXDN. **P25 Phase II is not supported** by DVM, and KeyUp flags any Phase II channel in DVM mode (the native backend treats it as a mode label only). `dvmbridge` speaks DMR, P25 and analog, so NXDN can't be a SIP, PoC or patch endpoint.
-- **WACN:** DVM refuses WACN `BEE00`, so KeyUp's default is `BB800` and it warns if `BEE00` is set.
-- **Trunked sites:** one Pi per trunked site. The control channel and its voice channels coordinate over localhost RPC.
-- **PoC** needs the DVM backend.
-- **Not yet tested here:** the Docker images, the Pi installer's build and the app store builds were written but not run in this environment (no Docker daemon, Pi, Android SDK or macOS). The fork binaries were built from source and exercised by the lab tests above, and SIP was tested with a simulated Asterisk.
+## Important limitations
+
+- **Packet voice interoperability is untested on real equipment.** The DFSI, IP Site Connect and Capacity Plus byte layouts are written from public and community descriptions and tested only against KeyUp's own simulators. Expect to adjust details against your stations and repeaters. Each protocol is isolated in `lmrcommon/dfsi.py` and `lmrcommon/ipsc.py`. Capacity Plus rest-channel and data features are not implemented; voice only.
+- **IMBE and AMBE+2 are proprietary DVSI vocoders.** KeyUp drives licensed DVSI AMBE-3000 hardware and has no software codec.
+  - Without DVSI hardware, calls that need IMBE ⇄ AMBE+2 or ⇄ analog conversion are dropped for that destination (the dashboard shows this), and recordings keep raw frames.
+  - The rate settings in `lmrcommon/dvsi.py` (`DEFAULT_RATES`) must be checked against your chip's manual. The test vocoder in `tools/fake_dvsi.py` is only a stand-in.
+- **Audio radios are conventional repeaters.** The Pi works through audio plus COR/PTT and does not generate a trunking control channel. Affiliations are inferred from radios being heard.
+- **The Windows console** was built and its core tested in CI, but the WireGuard tunnel and audio devices have not been tried on a real PC here.
+- **SIP and SIPREC** were tested against a simulated recorder and simulated ARI, not a commercial recorder or live Asterisk.
+- **Security:** change every default in `.env`, keep port 8080 reachable only inside the tunnel, and put the UI behind your SSO/VPN if possible. AES/ADP encryption is not implemented.
+- **Not for public safety or life safety use.**
 
 ## License
 
-KeyUp is licensed under the **GNU General Public License v2.0** (`LICENSE`), because it includes and modifies DVMProject's GPL-2.0 code. DVMProject's copyright notices are kept in every file of the fork; see `NOTICE` and `dvm/FORK.md`. The Windows dispatch console (`console/`) is a separate program under the **AGPL-3.0**, as its upstream is; see `console/FORK.md`.
+GPL-2.0 (see `LICENSE` and `NOTICE`). The console installer bundles the unmodified WireGuardNT driver library under its own license.

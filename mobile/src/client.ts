@@ -20,7 +20,7 @@ export type TxState = 'idle' | 'requesting' | 'transmitting';
 
 export interface RadioState {
   link: LinkState;
-  network: boolean; // radio system (FNE) reachable from the server
+  network: boolean; // radio network (edges/packet sites) connected to the server
   unit: { id: number; alias: string } | null;
   systemName: string;
   talkgroups: Talkgroup[];
