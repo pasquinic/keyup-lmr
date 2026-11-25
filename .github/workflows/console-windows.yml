@@ -6,7 +6,7 @@ name: Console · Windows build
 # Push a tag named console-vX.Y.Z to also publish them as a GitHub Release.
 on:
   push:
-    branches: [main, independent]
+    branches: [main]
     paths: ["console/**", ".github/workflows/console-windows.yml"]
     tags: ["console-v*"]
   workflow_dispatch:
