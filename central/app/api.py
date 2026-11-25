@@ -389,7 +389,7 @@ def _enroll(body: S.EnrollIn, db: Session):
         raise HTTPException(400, "invalid WireGuard public key")
     if db.query(EdgeDevice).filter(EdgeDevice.wg_public_key == body.wg_public_key).first():
         raise HTTPException(409, "public key already enrolled")
-    used = {d.wg_ip for d in db.query(EdgeDevice).all()}
+    used = {d.wg_ip for d in db.query(EdgeDevice).all()} | {c.wg_ip for c in db.query(DispatchConsole).all() if c.wg_ip}
     secret = secrets.token_urlsafe(32)
     dev = EdgeDevice(site_id=tok.site_id, hostname=body.hostname, serial=body.serial, model=body.model,
                      agent_version=body.agent_version, wg_public_key=body.wg_public_key,
@@ -702,3 +702,127 @@ async def poc_revoke(pk: int, db: Session = Depends(get_db)):
 @router.get("/poc/status", dependencies=admin)
 def poc_status():
     return state.poc.status() if state.poc else {"sessions": [], "emergencies": {}}
+
+
+# ============================================================== dispatch consoles
+def _apply_console(db, con: DispatchConsole, body: S.ConsoleIn) -> None:
+    if not db.get(Subscriber, body.subscriber_id):
+        raise HTTPException(400, f"radio id {body.subscriber_id} is not a subscriber; add it under Subscriber Radios first")
+    data = body.model_dump()
+    zone_ids = data.pop("zone_ids")
+    for k, v in data.items():
+        setattr(con, k, v)
+    con.zones = db.query(Zone).filter(Zone.id.in_(zone_ids)).all() if zone_ids else []
+
+
+@router.get("/consoles", dependencies=admin)
+def list_consoles(db: Session = Depends(get_db)):
+    online = {s["console"]: s for s in (state.dispatch.status()["sessions"] if state.dispatch else [])}
+    wg = state.wg.peer_status() if state.wg else {}
+    out = []
+    for c in db.query(DispatchConsole).order_by(DispatchConsole.id).all():
+        d = c.to_dict()
+        sub = db.get(Subscriber, c.subscriber_id)
+        d["subscriber_alias"] = sub.alias if sub else "?"
+        d["session"] = online.get(c.id)
+        d["wg"] = wg.get(c.wg_public_key) if c.wg_public_key else None
+        d["talkgroups"] = [t["id"] for t in unit_view(db, sub, zones=list(c.zones))["talkgroups"]] if sub else []
+        out.append(d)
+    return out
+
+
+@router.post("/consoles", dependencies=admin)
+async def create_console(body: S.ConsoleIn, db: Session = Depends(get_db)):
+    con = DispatchConsole()
+    _apply_console(db, con, body)
+    db.add(con)
+    db.commit()
+    await changed()
+    return con.to_dict()
+
+
+@router.put("/consoles/{pk}", dependencies=admin)
+async def update_console(pk: int, body: S.ConsoleIn, db: Session = Depends(get_db)):
+    con = _get_or_404(db, DispatchConsole, pk)
+    _apply_console(db, con, body)
+    db.commit()
+    await changed()
+    return con.to_dict()
+
+
+@router.delete("/consoles/{pk}", dependencies=admin)
+async def delete_console(pk: int, db: Session = Depends(get_db)):
+    con = _get_or_404(db, DispatchConsole, pk)
+    if con.wg_public_key and state.wg:
+        state.wg.remove_peer(con.wg_public_key)
+    db.delete(con)
+    db.commit()
+    await changed()
+    return {"ok": True}
+
+
+@router.post("/consoles/{pk}/activation", dependencies=admin)
+def console_activation(pk: int, db: Session = Depends(get_db)):
+    """One-time code the console trades for its login token and its WireGuard tunnel."""
+    con = _get_or_404(db, DispatchConsole, pk)
+    part = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(8))
+    con.activation_hash = hash_secret(part)
+    con.activation_expires = now() + dt.timedelta(hours=24)
+    db.commit()
+    return {"console_id": con.id, "name": con.name, "server": settings.public_url,
+            "code": f"{con.id}-{part[:4]}-{part[4:]}", "expires_at": con.activation_expires.isoformat() + "Z"}
+
+
+@router.post("/consoles/{pk}/revoke", dependencies=admin)
+async def console_revoke(pk: int, db: Session = Depends(get_db)):
+    con = _get_or_404(db, DispatchConsole, pk)
+    if con.wg_public_key and state.wg:
+        state.wg.remove_peer(con.wg_public_key)
+    con.token_hash = con.wg_public_key = con.activation_hash = ""
+    db.commit()
+    await changed()
+    bus.publish("console", action="revoked", console=con.id, name=con.name)
+    return con.to_dict()
+
+
+@router.post("/console/activate")
+async def console_activate(body: S.ActivateIn, db: Session = Depends(get_db)):
+    """Called by the console: trade the code for a token, the tunnel (keys + addresses) and the server URLs."""
+    from .services.poc import new_token, token_hash
+    from .services.wireguard import generate_keypair
+    head, _, rest = body.code.strip().upper().replace(" ", "").partition("-")
+    con = db.get(DispatchConsole, int(head)) if head.isdigit() else None
+    if (not con or not con.activation_hash or not con.activation_expires or con.activation_expires < now()
+            or not verify_secret(rest.replace("-", ""), con.activation_hash)):
+        time.sleep(1)
+        raise HTTPException(403, "invalid or expired activation code")
+    with _enroll_lock:
+        if con.wg_public_key and state.wg:
+            state.wg.remove_peer(con.wg_public_key)
+        priv, pub = generate_keypair()
+        if not con.wg_ip:
+            used = {d.wg_ip for d in db.query(EdgeDevice).all()} | {
+                c.wg_ip for c in db.query(DispatchConsole).all() if c.wg_ip}
+            con.wg_ip = state.wg.allocate_ip(used)
+        con.wg_public_key = pub
+        token = new_token()
+        con.token_hash = token_hash(token)
+        con.activation_hash, con.activation_expires = "", None
+        con.activated_at = now()
+        db.commit()
+        state.wg.add_peer(pub, con.wg_ip)
+        wg = state.wg.client_config(con.wg_ip)
+    await changed()
+    bus.publish("console", action="activated", console=con.id, name=con.name, machine=body.name[:64])
+    public = settings.public_url.rstrip("/")
+    return {"token": token, "console_id": con.id, "name": con.name, "server": public,
+            "urls": {"tunnel": f"ws://{wg['server_ip']}:{settings.http_port}/console/ws",
+                     "public": public.replace("https://", "wss://").replace("http://", "ws://") + "/console/ws"},
+            "wireguard": {"private_key": priv, "address": wg["address"], "server_public_key": wg["server_public_key"],
+                          "endpoint": wg["endpoint"], "allowed_ips": wg["allowed_ips"],
+                          "persistent_keepalive": wg["persistent_keepalive"]}}
+
+
+@router.get("/consoles/status", dependencies=admin)
+def consoles_status():
+    return state.dispatch.status() if state.dispatch else {"sessions": []}

@@ -9,6 +9,8 @@ Checks:
     ID, radio -> phone, busy / not-permitted denials, emergency priority, inhibit logs the phone out
   * recording: per-call audio with talkers, WAV playback, CSV log export, shipping over HTTPS,
     SIPREC (RFC 7866 metadata) and plain SIP to a simulated recorder with digest auth, retry on failure
+  * dispatch console: activation (token + WireGuard tunnel), zones, monitoring several talkgroups,
+    radio -> console audio, console talks over a radio (call priority), inhibit, patch, revoke
 """
 import asyncio
 import http.server
@@ -31,6 +33,7 @@ sys.path[:0] = [ROOT, os.path.join(ROOT, "tests"), os.path.join(ROOT, "tools")]
 import lab_e2e as lab  # noqa: E402
 from lab_e2e import wait  # noqa: E402
 from poc_client import PocClient, activate  # noqa: E402
+from console_client import ConsoleClient, activate as console_activate  # noqa: E402
 
 PORT = 18180
 lab.PORT, lab.BASE = PORT, f"http://127.0.0.1:{PORT}"
@@ -187,6 +190,72 @@ def recording_checks(tmp):
             f"({rec['rtp_packets']} RTP packets + RFC 7865 metadata) and SIP with digest auth; failures retried")
 
 
+async def console_checks():
+    ch = {c["name"]: c["id"] for c in req("GET", "/status", base=EDGE, auth=False)["channels"]}
+    req("POST", "/api/subscribers", {"id": 4004, "alias": "Dispatch"})
+    con = req("POST", "/api/consoles", {"name": "Dispatch 1", "subscriber_id": 4004})
+    code = req("POST", f"/api/consoles/{con['id']}/activation", {})["code"]
+    try:
+        req("POST", "/api/console/activate", {"code": f"{con['id']}-AAAA-AAAA"}, auth=False)
+        raise AssertionError("bad console code accepted")
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+    act = console_activate(BASE, code)
+    wg = act["wireguard"]
+    assert wg["private_key"] and wg["address"].endswith("/32") and wg["allowed_ips"].endswith("/32"), wg
+    assert act["urls"]["tunnel"].startswith("ws://") and act["urls"]["public"].endswith("/console/ws"), act["urls"]
+    c = ConsoleClient(act["urls"]["public"], act["token"])
+    prof = await c.connect()
+    assert prof["t"] == "auth_ok" and prof["rights"] == {"inhibit": True, "priority": True, "patch": True}, prof
+    assert [z["name"] for z in prof["zones"]] == ["Ops"], prof["zones"]   # 4004 may not use restricted TG 200
+    await c.monitor([100, 300])
+    # radio -> console, tagged with the talkgroup and talker
+    sim_key(ch["N-FD"], 1.5, 3003)
+    st = await c.wait_event("call_start", 5, tg=100)
+    assert st["src"] == 3003 and st["alias"] == "Portable", st
+    await c.wait_event("call_end", 6, tg=100)
+    assert c.rx_frames.get(100, 0) >= 60 and 3003 in c.rx_srcs[100], c.rx_frames
+    # call priority: the console talks over a radio
+    await asyncio.sleep(0.5)
+    before = edge_chan("N-FD")["voice_frames_played"]
+    sim_key(ch["N-FD"], 4, 3003)
+    await asyncio.sleep(0.7)
+    g = await c.talk(100, 1.5)
+    assert g["t"] == "grant", g
+    await asyncio.sleep(1.0)
+    assert edge_chan("N-FD")["voice_frames_played"] - before >= 60
+    assert any(x["source_id"] == 4004 and x["talkgroup_id"] == 100 for x in req("GET", "/api/calls?limit=20"))
+    # inhibit / uninhibit a radio
+    await c.send({"t": "inhibit", "unit": 3003, "on": True})
+    r = await c.wait_event("inhibit_result")
+    assert r["ok"] and not next(s for s in req("GET", "/api/subscribers") if s["id"] == 3003)["enabled"], r
+    await c.send({"t": "inhibit", "unit": 3003, "on": False})
+    assert (await c.wait_event("inhibit_result"))["ok"]
+    assert next(s for s in req("GET", "/api/subscribers") if s["id"] == 3003)["enabled"]
+    # patch two talkgroups and unpatch
+    async def profile_where(pred):
+        end = time.time() + 5
+        while time.time() < end:
+            p = await c.wait_event("profile", max(0.1, end - time.time()))
+            if pred(p):
+                return p
+        raise AssertionError("no matching profile")
+    await c.send({"t": "patch", "tgs": [100, 300], "on": True})
+    await profile_where(lambda p: any({x["tg_a"], x["tg_b"]} == {100, 300} for x in p["patches"]))
+    assert any({x["tg_a"], x["tg_b"]} == {100, 300} for x in req("GET", "/api/patches"))
+    await c.send({"t": "patch", "tgs": [100, 300], "on": False})
+    await profile_where(lambda p: not p["patches"])
+    # shown online with its transport, then revoked
+    row = next(x for x in req("GET", "/api/consoles") if x["id"] == con["id"])
+    assert row["session"] and row["session"]["transport"] == "https" and row["wg_ip"], row
+    req("POST", f"/api/consoles/{con['id']}/revoke", {})
+    ev = await c.wait_event("auth_fail", 5)
+    assert ev["reason"] == "console_revoked", ev
+    await c.close()
+    return ("activated (token + WireGuard keys), zones, radio -> console audio with talker, console talks over a "
+            "radio, inhibit / uninhibit, patch / unpatch, revoke")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="keyup-features-")
     env = {**os.environ, "PYTHONPATH": f"{ROOT}:{ROOT}/central", "LMR_DATA_DIR": tmp,
@@ -228,6 +297,7 @@ def main():
             assert e.code == 403
         print(f"ok  PoC: {asyncio.run(poc_checks())}")
         print(f"ok  Recording: {recording_checks(tmp)}")
+        print(f"ok  Dispatch console: {asyncio.run(console_checks())}")
         print("\nALL FEATURE LAB TESTS PASSED")
     finally:
         for p in procs:

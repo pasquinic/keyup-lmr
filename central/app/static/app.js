@@ -256,6 +256,12 @@ function connectLive() {
     else if (e.event === "device") logEvent(`DEVICE ${e.device_id} ${e.status}`, e.ts);
     else if (e.event === "calls_imported") logEvent(`Imported ${e.count} site-trunking call records from site ${e.site_id}`, e.ts);
     else if (e.event === "sip_leg") logEvent(`SIP ${e.caller} ${e.action} on TG ${e.tg}`, e.ts);
+    else if (e.event === "poc") logEvent(`PoC ${e.alias || e.unit} ${e.action}${e.platform ? " (" + e.platform + ")" : ""}`, e.ts);
+    else if (e.event === "console") logEvent(`Console ${e.name} ${e.action}${e.transport ? " via " + e.transport : ""}`, e.ts);
+    else if (e.event === "inhibit") logEvent(`Radio ${e.unit} ${e.on ? "inhibited" : "uninhibited"} by ${e.by}`, e.ts);
+    else if (e.event === "patch") logEvent(`Patch TG ${e.tgs.join(" + ")} ${e.on ? "linked" : "unlinked"} by ${e.by}`, e.ts);
+    else if (e.event === "emergency") logEvent(`⚠ EMERGENCY ${e.on ? "declared" : "cleared"} TG ${e.tg} by ${e.alias || e.unit} (${e.via || "radio"})`, e.ts);
+    else if (e.event === "recording_shipped" && !e.status.startsWith("sent")) logEvent(`Recording ${e.record_id} shipping: ${e.status}`, e.ts);
   };
 }
 
@@ -374,6 +380,56 @@ pages.poc = async el => {
     }
   };
 };
+
+pages.consoles = async el => {
+  await options("zones");
+  await resourcePage({
+    path: "consoles", title: "Dispatch Console",
+    columns: [{key: "id", label: "#"}, {key: "name", label: "Name"},
+      {label: "Radio ID", render: r => `<span class="mono">${esc(r.subscriber_id)}</span> ${esc(r.subscriber_alias)}`},
+      {label: "Zones", render: r => r.zone_ids.length ? esc(r.zone_ids.map(id => cache.zones?.find(z => z.id === id)?.name ?? id).join(", ")) : '<span class="muted">radio ID\'s zones</span>'},
+      {label: "Talkgroups", render: r => r.talkgroups.length ? esc(r.talkgroups.join(", ")) : '<span class="muted">none permitted</span>'},
+      {label: "Rights", render: r => [r.can_inhibit && "inhibit", r.call_priority && "priority", r.can_patch && "patch"].filter(Boolean).join(" · ") || '<span class="muted">—</span>'},
+      {label: "Tunnel", render: r => r.wg_ip ? `<span class="mono">${esc(r.wg_ip)}</span>${r.wg?.latest_handshake ? " · " + ago(new Date(r.wg.latest_handshake * 1000).toISOString()) : ""}` : '<span class="muted">—</span>'},
+      {label: "Status", render: r => !r.enabled ? pill("disabled") : r.session ? `${pill("online")} <span class="muted">${esc(r.session.transport)}</span>` : r.activated ? pill("offline") : pill("not activated", "mode")},
+      {label: "Last seen", render: r => r.last_seen ? ago(r.last_seen) : "—"}],
+    rowActions: r => `<button class="btn sm" data-cact="${esc(r.id)}">Activate</button> ${r.activated ? `<button class="btn sm danger" data-crev="${esc(r.id)}">Revoke</button> ` : ""}`,
+    fields: [{name: "name", label: "Name", required: true, placeholder: "Dispatch 1"},
+      {name: "subscriber_id", label: "Transmits as radio ID", type: "select", options: "subscribers", numeric: true},
+      {name: "zone_ids", label: "Zones on the console (none = the radio ID's zones)", type: "multi", options: "zones", wide: true},
+      {name: "can_inhibit", label: "May inhibit / uninhibit radios", type: "bool", default: true},
+      {name: "call_priority", label: "Call priority over radios (not over emergencies)", type: "bool", default: true},
+      {name: "can_patch", label: "May patch talkgroups", type: "bool", default: true},
+      {name: "enabled", label: "Enabled", type: "bool", default: true},
+      {name: "notes", label: "Notes", type: "textarea", wide: true}],
+  })(el);
+  el.insertAdjacentHTML("afterbegin", `<div class="card" style="margin-bottom:16px"><h3>KeyUp Dispatch Console for Windows</h3>
+    <p class="muted">A console transmits as its radio ID under the same talkgroup rules as a radio, monitors its zones' talkgroups at once, and (if allowed) inhibits radios, patches talkgroups and talks over radios.
+    Install the console on the PC, press <b>Activate</b> here and enter the server and code in the console. The console sets up its own WireGuard tunnel
+    (it asks for administrator rights once); without the tunnel it connects over HTTPS.</p></div>`);
+  el.addEventListener("click", async e => {
+    const act = e.target.dataset?.cact, rev = e.target.dataset?.crev;
+    if (act) { e.stopPropagation(); await consoleActivation(act); }
+    if (rev) {
+      e.stopPropagation();
+      if (!confirm("Revoke this console? Its login and tunnel stop working at once; activate it again to reconnect.")) return;
+      try { await api(`/consoles/${rev}/revoke`, {method: "POST"}); toast("Revoked"); route(); } catch (err) { toast(err.message, true); }
+    }
+  }, true);
+};
+
+async function consoleActivation(id) {
+  try {
+    const a = await api(`/consoles/${id}/activation`, {method: "POST"});
+    const m = $("#modal"), f = $("#modalForm");
+    f.innerHTML = `<h2>Activate console ${esc(a.name)}</h2>
+      <dl class="kv"><dt>Server</dt><dd class="mono">${esc(a.server)}</dd>
+      <dt>Code</dt><dd style="font-size:22px;letter-spacing:3px" class="mono">${esc(a.code)}</dd><dt>Expires</dt><dd>${new Date(a.expires_at).toLocaleString()}</dd></dl>
+      <p class="muted">In the KeyUp Dispatch Console choose <b>Connect to KeyUp…</b> and enter the server and code. The code works once; activating again moves the console to a new PC.</p>
+      <div class="formfoot"><button class="btn primary" value="cancel">Done</button></div>`;
+    m.showModal(); f.onsubmit = () => { m.close(); route(); };
+  } catch (err) { toast(err.message, true); }
+}
 
 pages.zones = async el => {
   await options("zones");
@@ -628,7 +684,7 @@ pages.settings = async el => {
 };
 
 // ------------------------------------------------------------------ router
-const TITLES = {zones: "Zones", poc: "PoC Phones (Cellular Subscribers)", network: "Network", bandplan: "Band Plan", patches: "Talkgroup Patches", dashboard: "Dashboard", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
+const TITLES = {consoles: "Dispatch Consoles", zones: "Zones", poc: "PoC Phones (Cellular Subscribers)", network: "Network", bandplan: "Band Plan", patches: "Talkgroup Patches", dashboard: "Dashboard", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
   subscribers: "Subscriber Radios", sip: "SIP Interconnect", calls: "Call History & Recordings", settings: "System Settings"};
 async function route() {
   const page = (location.hash.slice(2).split("?")[0]) || "dashboard";
