@@ -59,7 +59,7 @@ class Site(DictMixin, Base):
     network_codec: Mapped[str] = mapped_column(String(8), default="AUTO")  # AUTO|ULAW|IMBE|AMBE2|PCM16
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     notes: Mapped[str] = mapped_column(Text, default="")
-    callsign: Mapped[str] = mapped_column(String(16), default="")  # CW ID (blank = off)
+    callsign: Mapped[str] = mapped_column(String(16), default="")  # station ID sent in CW by the edge
     latitude: Mapped[float] = mapped_column(Float, default=0.0)
     longitude: Mapped[float] = mapped_column(Float, default=0.0)
     # runtime
@@ -118,10 +118,6 @@ class TalkGroup(DictMixin, Base):
     site_ids: Mapped[str] = mapped_column(String(256), default="")        # comma list of allowed sites; blank = all
     sip_extension: Mapped[str] = mapped_column(String(32), default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    # DVM / interconnect
-    dmr_slot: Mapped[int] = mapped_column(Integer, default=1)
-    bridge_mode: Mapped[str] = mapped_column(String(8), default="P25P1")   # mode the SIP/PoC bridge speaks on this TG
-    allow_poc: Mapped[bool] = mapped_column(Boolean, default=True)         # selectable by PoC (cellular) subscribers
 
 
 class Channel(DictMixin, Base):
@@ -158,15 +154,6 @@ class Channel(DictMixin, Base):
     serial_port: Mapped[str] = mapped_column(String(64), default="")
     cor_invert: Mapped[bool] = mapped_column(Boolean, default=False)    # serial: CTS low = carrier
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    # DVM (dvmhost / dvmbridge) settings
-    peer_id: Mapped[int | None] = mapped_column(Integer, unique=True, nullable=True)  # FNE peer id (auto)
-    modem_type: Mapped[str] = mapped_column(String(8), default="uart")   # uart | null (lab)
-    modem_mode: Mapped[str] = mapped_column(String(8), default="air")    # air (DVM-V1/hotspot) | dfsi (V.24)
-    modem_port: Mapped[str] = mapped_column(String(64), default="/dev/ttyUSB0")
-    modem_speed: Mapped[int] = mapped_column(Integer, default=115200)
-    rx_level: Mapped[int] = mapped_column(Integer, default=50)
-    tx_level: Mapped[int] = mapped_column(Integer, default=50)
-    power_w: Mapped[int] = mapped_column(Integer, default=10)
 
     site = relationship("Site", back_populates="channels")
 
@@ -182,16 +169,11 @@ class Subscriber(DictMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     notify_site_trunking: Mapped[bool] = mapped_column(Boolean, default=True)
     notes: Mapped[str] = mapped_column(Text, default="")
-    # Push-to-talk over cellular: the phone app is this radio ID on the system
-    poc_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    poc_activation_hash: Mapped[str] = mapped_column(String(128), default="")
-    poc_activation_expires: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     last_site_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_tg_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     talkgroups = relationship("TalkGroup", secondary=subscriber_talkgroups, lazy="selectin")
-    _hidden = ("poc_activation_hash",)
 
     def to_dict(self):
         d = super().to_dict()
@@ -199,78 +181,24 @@ class Subscriber(DictMixin, Base):
         return d
 
 
-class PocDevice(DictMixin, Base):
-    """A phone activated as a subscriber radio (one radio ID may have a few devices)."""
-    __tablename__ = "poc_devices"
-    _hidden = ("token_hash",)
-    id: Mapped[int] = mapped_column(primary_key=True)
-    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id", ondelete="CASCADE"), index=True)
-    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    name: Mapped[str] = mapped_column(String(64), default="")
-    platform: Mapped[str] = mapped_column(String(16), default="")
-    app_version: Mapped[str] = mapped_column(String(16), default="")
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
-    last_seen: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
-    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
-
-
-class DispatchConsole(DictMixin, Base):
-    """A PC running the KeyUp Dispatch Console (dvmconsole fork): an FNE peer that transmits as a radio ID."""
-    __tablename__ = "dispatch_consoles"
-    _hidden = ("token_hash", "activation_hash")
-    id: Mapped[int] = mapped_column(primary_key=True)
-    name: Mapped[str] = mapped_column(String(64))
-    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id", ondelete="CASCADE"), index=True)
-    peer_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)   # blank = 9300000 + id
-    talkgroup_ids: Mapped[str] = mapped_column(String(1024), default="")  # comma list; blank = all the radio may use
-    can_inhibit: Mapped[bool] = mapped_column(Boolean, default=True)      # may send inhibit / uninhibit
-    call_priority: Mapped[bool] = mapped_column(Boolean, default=True)    # FNE call priority over radios
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    wg_public_key: Mapped[str] = mapped_column(String(64), default="")
-    wg_ip: Mapped[str] = mapped_column(String(45), default="")
-    token_hash: Mapped[str] = mapped_column(String(64), default="")
-    activation_hash: Mapped[str] = mapped_column(String(128), default="")
-    activation_expires: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
-    activated_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
-    last_sync: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
-    notes: Mapped[str] = mapped_column(Text, default="")
-
-    @property
-    def fne_peer_id(self) -> int:
-        return self.peer_id or 9300000 + self.id
-
-    def tg_list(self) -> list[int]:
-        return [int(x) for x in (self.talkgroup_ids or "").split(",") if x.strip().isdigit()]
-
-    def to_dict(self):
-        d = super().to_dict()
-        d["fne_peer_id"] = self.fne_peer_id
-        d["activated"] = bool(self.token_hash)
-        d["talkgroup_ids"] = self.tg_list()
-        return d
-
-
-class IdenEntry(DictMixin, Base):
-    """Band plan identity (DVM iden_table.dat): maps channel numbers to frequencies."""
-    __tablename__ = "iden_table"
-    id: Mapped[int] = mapped_column(primary_key=True)  # channel identity 0..15
+class BandPlanEntry(DictMixin, Base):
+    """Channel identity: channel number n is base + n * spacing; the receive (input) is offset from transmit."""
+    __tablename__ = "band_plan"
+    id: Mapped[int] = mapped_column(primary_key=True)  # identity 0..15
     name: Mapped[str] = mapped_column(String(64), default="")
     base_mhz: Mapped[float] = mapped_column(Float)
     spacing_khz: Mapped[float] = mapped_column(Float, default=6.25)
-    offset_mhz: Mapped[float] = mapped_column(Float, default=5.0)  # RX (input) = TX + offset
+    offset_mhz: Mapped[float] = mapped_column(Float, default=5.0)
     bandwidth_khz: Mapped[float] = mapped_column(Float, default=12.5)
 
 
-class Patch(DictMixin, Base):
-    """Talkgroup patch: a call on either talkgroup is heard on both.
-    DVM backend: two dvmbridges back to back in the given modes. Native backend: router link (it transcodes)."""
-    __tablename__ = "patches"
+class TalkgroupPatch(DictMixin, Base):
+    """Links two talkgroups: a call on either is heard on both (across modes; the router transcodes)."""
+    __tablename__ = "talkgroup_patches"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(64))
-    tg_a: Mapped[int] = mapped_column(Integer)
-    mode_a: Mapped[str] = mapped_column(String(8), default="DMR")
-    tg_b: Mapped[int] = mapped_column(Integer)
-    mode_b: Mapped[str] = mapped_column(String(8), default="P25P1")
+    tg_a: Mapped[int] = mapped_column(ForeignKey("talkgroups.id", ondelete="CASCADE"))
+    tg_b: Mapped[int] = mapped_column(ForeignKey("talkgroups.id", ondelete="CASCADE"))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
@@ -321,8 +249,8 @@ class SystemSetting(Base):
 
 DEFAULT_SYSTEM_SETTINGS = {
     "system_name": "KeyUp",
-    "wacn": "BB800",                     # P25 WACN / DVM netId (hex)
-    "system_id": "1A1",                 # P25 system id / DVM sysId (hex)
+    "wacn": "BEE00",
+    "system_id": "1A1",
     "require_known_subscriber": "false",
     "site_trunking_timeout_s": "10",
     "site_trunking_announce_interval_s": "300",
@@ -333,11 +261,4 @@ DEFAULT_SYSTEM_SETTINGS = {
     "affiliation_timeout_s": "1800",   # a radio counts as affiliated at a site this long after it was heard
     "cw_id_interval_s": "600",         # edges identify each transmitter in CW at most this often
     "parrot_delay_ms": "1000",
-    # DVM foundation
-    "call_backend": "dvm",               # dvm (DVMProject FNE + dvmhost) | native (KeyUp router)
-    "dvm_license_acknowledged": "false", # must be set by the operator (DVM iAgreeNotToBeStupid)
-    "fne_peer_id": "9000100",
-    "fne_address": "10.77.0.1",          # FNE address as seen by edges (tunnel IP)
-    "fne_port": "62031",
-    "dmr_net_id": "1",
 }

@@ -6,4 +6,3 @@ __pycache__/
 *.db
 .venv/
 venv/
-dvm/dvmhost/build/

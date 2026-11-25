@@ -34,11 +34,6 @@ class Settings:
     # Allow edges outside the tunnel (dev/lab only). Production: false.
     allow_untunneled_edges: bool = _bool("ALLOW_UNTUNNELED_EDGES", False)
 
-    # DVMProject (FNE runs in the "dvm" container; KeyUp writes its config here)
-    dvm_dir: str = os.getenv("DVM_DIR", os.path.join(os.getenv("LMR_DATA_DIR", "./data"), "dvm"))
-    fne_rest_port: int = int(os.getenv("FNE_REST_PORT", "9990"))
-    fne_rest_password: str = os.getenv("FNE_REST_PASSWORD", "change-me-fne")
-
     # Transcoding (comma separated serial ports of DVSI AMBE-3000 devices)
     dvsi_ports: list[str] = field(default_factory=lambda: [p for p in os.getenv("DVSI_PORTS", "").split(",") if p])
     dvsi_baud: int = int(os.getenv("DVSI_BAUD", "460800"))

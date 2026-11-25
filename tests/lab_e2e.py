@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end lab test of the NATIVE backend: central + two simulated edge sites on one machine (no radios, no WireGuard).
+"""End-to-end lab test: central + two simulated edge sites on one machine (no radios, no WireGuard).
 
   python3 tests/lab_e2e.py
 
@@ -56,8 +56,7 @@ def main():
     tmp = tempfile.mkdtemp(prefix="lmr-lab-")
     env = {**os.environ, "PYTHONPATH": f"{ROOT}:{ROOT}/central", "LMR_DATA_DIR": tmp,
            "DATABASE_URL": f"sqlite:///{tmp}/lmr.db", "WG_ENABLED": "false", "ALLOW_UNTUNNELED_EDGES": "true",
-           "HTTP_PORT": str(PORT), "VOICE_PORT": "15000", "HTTP_HOST": "127.0.0.1", "LOG_LEVEL": "WARNING",
-           "KEYUP_DEFAULT_BACKEND": "native"}
+           "HTTP_PORT": str(PORT), "VOICE_PORT": "15000", "HTTP_HOST": "127.0.0.1", "LOG_LEVEL": "WARNING"}
     procs = []
 
     def start_central():

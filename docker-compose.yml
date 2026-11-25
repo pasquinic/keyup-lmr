@@ -32,7 +32,6 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://lmr:${POSTGRES_PASSWORD}@127.0.0.1:5432/lmr
-      DVM_DIR: /data/dvm
     volumes:
       - ./data:/data
       - /lib/modules:/lib/modules:ro
@@ -43,17 +42,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-
-  dvm:
-    # DVMProject FNE + dvmbridges (SIP talkgroups, cross-mode patches). KeyUp writes their
-    # configuration into ./data/dvm/instances; the supervisor (re)starts them on change.
-    build:
-      context: .
-      dockerfile: dvm/Dockerfile
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ./data/dvm:/etc/dvm
 
   asterisk:
     build: ./asterisk

@@ -21,7 +21,7 @@ from lmrcommon.protocol import (FrameType, Flags, Msg, VoiceFrame, parse_keepali
 from ..config import settings
 from ..db import session_scope
 from ..models import (CallRecord, Channel, EdgeDevice, Site, Subscriber, SystemSetting, TalkGroup,
-                      Patch, DEFAULT_SYSTEM_SETTINGS, now)
+                      TalkgroupPatch, DEFAULT_SYSTEM_SETTINGS, now)
 from .rules import Affiliations, link_groups, site_list
 from .events import bus
 from .transcoder import TranscoderService
@@ -142,9 +142,6 @@ class CallController:
         self.affiliations = Affiliations()
         self.aff_timeout = 1800.0
         self._parrot_ids = itertools.count(1)
-        self.fne = None          # FneMonitor when call_backend == dvm
-        self.hub = None          # TgAudioHub (SIP + PoC interconnect) when call_backend == dvm
-        self.poc = None          # PocGateway when call_backend == dvm
 
     # -------------------------------------------------------------- helpers
     def endpoint(self, key: str) -> Endpoint | None:
@@ -166,7 +163,7 @@ class CallController:
             self.tg_rules = {t.id: {"site_ids": site_list(t.site_ids), "affiliated_only": t.affiliated_only,
                                     "parrot": t.parrot, "restricted": t.restricted} for t in tgs}
             self.unit_aliases = {s.id: s.alias for s in db.query(Subscriber).all()}
-            self.links = link_groups([p.to_dict() for p in db.query(Patch).all()])
+            self.links = link_groups([p.to_dict() for p in db.query(TalkgroupPatch).all()])
             self.aff_timeout = float(get_system_settings(db).get("affiliation_timeout_s", 1800))
 
     def linked(self, tg: int) -> frozenset[int]:
@@ -203,15 +200,8 @@ class CallController:
             if s.home_site_id == site_id or not ids or ids & tg_ids:
                 subs.append({"id": s.id, "alias": s.alias, "home": s.home_site_id == site_id,
                              "talkgroups": sorted(ids), "notify": s.notify_site_trunking})
-        cfg = {"type": Msg.CONFIG, "site": site.to_dict(), "channels": channels, "talkgroups": tgs,
-               "subscribers": subs, "settings": sysset, "backend": sysset.get("call_backend", "dvm")}
-        if cfg["backend"] == "dvm":
-            from .dvm import DvmPlan
-            plan = DvmPlan(db)
-            cfg["dvm"] = {"license_acknowledged": plan.ack,
-                          "instances": plan.site_instances(site_id) if plan.ack else {},
-                          "warnings": plan.warnings}
-        return cfg
+        return {"type": Msg.CONFIG, "site": site.to_dict(), "channels": channels, "talkgroups": tgs,
+                "subscribers": subs, "settings": sysset}
 
     async def push_config(self, site_id: int) -> None:
         sess = self.sessions.get(site_id)
@@ -288,13 +278,8 @@ class CallController:
         t = msg.get("type")
         if t == Msg.HEARTBEAT:
             sess.last_heartbeat = time.time()
-            mode = msg.get("mode", "wide_area")
-            if mode != sess.mode:
-                bus.publish("site", site_id=sess.site_id, status=mode if mode == "site_trunking" else "online",
-                            detail={"mode": mode})
-            sess.mode = mode
-            self._set_site_status(sess.site_id, "site_trunking" if mode == "site_trunking" else "online",
-                                  device_id=sess.device_id, telemetry=msg.get("telemetry", {}))
+            sess.mode = msg.get("mode", "wide_area")
+            self._set_site_status(sess.site_id, "online", device_id=sess.device_id, telemetry=msg.get("telemetry", {}))
             await sess.send({"type": Msg.HEARTBEAT_ACK, "ts": time.time()})
         elif t == Msg.CALL_REQUEST:
             await self.request_call(sess, msg)
@@ -638,13 +623,10 @@ class CallController:
         self.route_frame(sess.key, frame)
 
     def status(self) -> dict:
-        calls = [c.summary(self) for c in self.calls.values()]
-        if self.fne is not None:
-            calls += list(self.fne.active.values())
         return {
             "sites_connected": len(self.sessions),
             "sip_legs": len(self.sip_legs),
-            "active_calls": calls,
+            "active_calls": [c.summary(self) for c in self.calls.values()],
             **self.stats,
         }
 

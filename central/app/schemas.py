@@ -4,7 +4,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-Mode = Literal["P25P1", "P25P2", "DMR", "NXDN", "ANALOG"]  # P25P2 only in native backend
+Mode = Literal["P25P1", "P25P2", "DMR", "NXDN", "ANALOG"]
 
 
 class Login(BaseModel):
@@ -39,9 +39,6 @@ class TalkGroupIn(BaseModel):
     site_ids: str = Field("", pattern=r"^[0-9, ]*$")
     sip_extension: str = ""
     enabled: bool = True
-    dmr_slot: int = Field(1, ge=1, le=2)
-    bridge_mode: Literal["P25P1", "DMR", "ANALOG"] = "P25P1"
-    allow_poc: bool = True
 
 
 class ChannelIn(BaseModel):
@@ -72,32 +69,6 @@ class ChannelIn(BaseModel):
     serial_port: str = ""
     cor_invert: bool = False
     enabled: bool = True
-    peer_id: Optional[int] = None
-    modem_type: Literal["uart", "null"] = "uart"
-    modem_mode: Literal["air", "dfsi"] = "air"
-    modem_port: str = "/dev/ttyUSB0"
-    modem_speed: int = 115200
-    rx_level: int = Field(50, ge=0, le=100)
-    tx_level: int = Field(50, ge=0, le=100)
-    power_w: int = 10
-
-
-class IdenIn(BaseModel):
-    id: int = Field(ge=0, le=15)
-    name: str = ""
-    base_mhz: float
-    spacing_khz: float = 6.25
-    offset_mhz: float = 5.0
-    bandwidth_khz: float = 12.5
-
-
-class PatchIn(BaseModel):
-    name: str
-    tg_a: int
-    mode_a: Literal["P25P1", "DMR", "ANALOG"] = "DMR"
-    tg_b: int
-    mode_b: Literal["P25P1", "DMR", "ANALOG"] = "P25P1"
-    enabled: bool = True
 
 
 class SubscriberIn(BaseModel):
@@ -111,7 +82,6 @@ class SubscriberIn(BaseModel):
     notify_site_trunking: bool = True
     notes: str = ""
     talkgroup_ids: list[int] = []
-    poc_enabled: bool = False
 
 
 class SipRouteIn(BaseModel):
@@ -146,26 +116,17 @@ class OriginateIn(BaseModel):
     caller_id: str = "LMR"
 
 
-class PocActivateIn(BaseModel):
-    unit: int
-    code: str
-    device_name: str = ""
-    platform: str = ""
-    app_version: str = ""
+class BandPlanIn(BaseModel):
+    id: int = Field(ge=0, le=15)
+    name: str = ""
+    base_mhz: float = Field(gt=0)
+    spacing_khz: float = Field(6.25, gt=0)
+    offset_mhz: float = 5.0
+    bandwidth_khz: float = 12.5
 
 
-class ConsoleIn(BaseModel):
+class PatchIn(BaseModel):
     name: str
-    subscriber_id: int
-    peer_id: int | None = None
-    talkgroup_ids: list[int] = []
-    can_inhibit: bool = True
-    call_priority: bool = True
+    tg_a: int
+    tg_b: int
     enabled: bool = True
-    notes: str = ""
-
-
-class ConsoleActivateIn(BaseModel):
-    code: str
-    machine: str = ""
-    app_version: str = ""

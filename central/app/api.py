@@ -7,7 +7,7 @@ import threading
 import time
 from collections import Counter
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -16,9 +16,9 @@ from lmrcommon.modes import MODE_CODEC, MODE_LABELS, SystemMode
 from . import schemas as S
 from .config import settings
 from .db import get_db
-from .models import (CallRecord, Channel, DispatchConsole, EdgeDevice, EnrollmentToken, IdenEntry, Patch, PocDevice, SipRoute,
-                     Site, Subscriber, SystemSetting, TalkGroup, User, now)
-from .services import dvm, rules
+from .models import (BandPlanEntry, CallRecord, Channel, EdgeDevice, EnrollmentToken, SipRoute, Site, Subscriber,
+                     SystemSetting, TalkGroup, TalkgroupPatch, User, now)
+from .services import rules
 from .security import current_user, hash_secret, issue_token, verify_secret
 from .services.call_controller import get_system_settings
 from .services.events import bus
@@ -31,18 +31,8 @@ admin = [Depends(current_user)]
 
 
 async def changed():
-    if state.fne is not None:
-        try:
-            await dvm.apply(state.fne)
-        except Exception as e:  # never block a UI save on config generation
-            import logging
-            logging.getLogger("api").exception("DVM apply failed: %s", e)
     if state.ctl:
         await state.ctl.push_all_configs()
-    if state.ctl and state.ctl.hub:
-        state.ctl.hub.refresh()
-    if state.poc:
-        await state.poc.refresh()
 
 
 # ============================================================== auth
@@ -78,16 +68,6 @@ def _get_or_404(db, model, pk):
     return obj
 
 
-def _fixup(db, obj) -> None:
-    """Model-specific defaults/validation shared by create and update."""
-    if isinstance(obj, Channel):
-        if not obj.peer_id:
-            obj.peer_id = dvm.default_peer_id(obj.site_id, obj.slot)
-        clash = db.query(Channel).filter(Channel.peer_id == obj.peer_id, Channel.id != obj.id).first()
-        if clash:
-            raise HTTPException(409, f"peer id {obj.peer_id} already used by channel {clash.name}")
-
-
 def crud(path: str, model, schema, order=None, pk_in_body=True):
     @router.get(f"/{path}", dependencies=admin, name=f"list_{path}")
     def list_(db: Session = Depends(get_db)):
@@ -102,7 +82,6 @@ def crud(path: str, model, schema, order=None, pk_in_body=True):
         if pk_in_body and db.get(model, data["id"]):
             raise HTTPException(409, f"id {data['id']} already exists")
         obj = model(**data)
-        _fixup(db, obj)
         db.add(obj)
         db.commit()
         await changed()
@@ -114,7 +93,6 @@ def crud(path: str, model, schema, order=None, pk_in_body=True):
         for k, v in body.model_dump().items():
             if k != "id":
                 setattr(obj, k, v)
-        _fixup(db, obj)
         db.commit()
         await changed()
         return obj.to_dict()
@@ -131,8 +109,8 @@ crud("sites", Site, S.SiteIn, Site.id)
 crud("talkgroups", TalkGroup, S.TalkGroupIn, TalkGroup.id)
 crud("channels", Channel, S.ChannelIn, Channel.site_id, pk_in_body=False)
 crud("sip/routes", SipRoute, S.SipRouteIn, SipRoute.id, pk_in_body=False)
-crud("idens", IdenEntry, S.IdenIn, IdenEntry.id)
-crud("patches", Patch, S.PatchIn, Patch.id, pk_in_body=False)
+crud("bandplan", BandPlanEntry, S.BandPlanIn, BandPlanEntry.id)
+crud("patches", TalkgroupPatch, S.PatchIn, TalkgroupPatch.id, pk_in_body=False)
 
 
 # subscribers need the talkgroup many-to-many
@@ -204,8 +182,8 @@ def frequency_plan(db: Session = Depends(get_db)):
     """System-wide frequency plan with simple conflict detection."""
     chans = db.query(Channel).order_by(Channel.tx_mhz).all()
     sites = {s.id: s.name for s in db.query(Site).all()}
-    idens = [i.to_dict() for i in db.query(IdenEntry).order_by(IdenEntry.id).all()]
     tx = Counter(round(c.tx_mhz, 5) for c in chans if c.tx_mhz)
+    plan = [b.to_dict() for b in db.query(BandPlanEntry).all()]
     rows = []
     for c in chans:
         warn = []
@@ -213,13 +191,10 @@ def frequency_plan(db: Session = Depends(get_db)):
             warn.append("TX frequency reused at another site/slot (check spacing & simulcast intent)")
         if c.rx_mhz and c.tx_mhz and abs(c.rx_mhz - c.tx_mhz) < 0.0001 and c.mode != "ANALOG":
             warn.append("simplex: RX = TX")
-        slot = rules.locate_channel(c.tx_mhz, c.rx_mhz, idens) if idens else rules.ChannelSlot(None, 0, [])
-        if c.mode == "P25P2" and _backend(db) == "dvm":
-            warn.append("P25 Phase II is not supported by DVM")
+        slot = rules.locate_channel(c.tx_mhz, c.rx_mhz, plan) if plan else rules.ChannelSlot(None, 0, [])
         rows.append({**c.to_dict(), "site_name": sites.get(c.site_id, "?"),
                      "codec": MODE_CODEC[SystemMode(c.mode)].name, "warnings": warn + slot.problems,
-                     "identity": slot.identity, "channel_no": slot.number,
-                     "iden": slot.identity, "ch_no": slot.number})
+                     "identity": slot.identity, "channel_no": slot.number})
     return rows
 
 
@@ -228,9 +203,9 @@ def _checks(db) -> list[dict]:
     return rules.config_checks([x.to_dict() for x in db.query(Site).all()],
                                [x.to_dict() for x in db.query(Channel).all()],
                                [x.to_dict() for x in db.query(TalkGroup).all()],
-                               [x.to_dict() for x in db.query(Patch).all()],
-                               [x.to_dict() for x in db.query(IdenEntry).all()],
-                               [x.to_dict() for x in db.query(EdgeDevice).all()], _backend(db))
+                               [x.to_dict() for x in db.query(TalkgroupPatch).all()],
+                               [x.to_dict() for x in db.query(BandPlanEntry).all()],
+                               [x.to_dict() for x in db.query(EdgeDevice).all()])
 
 
 @router.get("/network", dependencies=admin)
@@ -256,30 +231,6 @@ def network_preview(site_id: int, db: Session = Depends(get_db)):
     """The configuration KeyUp pushes to a site's edge device."""
     _get_or_404(db, Site, site_id)
     return state.ctl.build_config(db, site_id)
-
-
-def _backend(db) -> str:
-    return get_system_settings(db).get("call_backend", "dvm")
-
-
-# ============================================================== DVM
-@router.get("/dvm/status", dependencies=admin)
-def dvm_status(db: Session = Depends(get_db)):
-    plan = dvm.DvmPlan(db)
-    central = plan.central_instances() if plan.ack else {}
-    for sid in plan.sites:
-        plan.site_instances(sid)  # collects warnings
-    return {"backend": _backend(db), "license_acknowledged": plan.ack, "dvm_ref": dvm.DVM_REF,
-            "fne": state.fne.status() if state.fne else None,
-            "central_instances": sorted(central), "warnings": plan.warnings}
-
-
-@router.get("/dvm/preview", dependencies=admin)
-def dvm_preview(site_id: int | None = None, db: Session = Depends(get_db)):
-    """Show the generated DVM files (FNE when site_id is omitted)."""
-    plan = dvm.DvmPlan(db)
-    inst = plan.site_instances(site_id) if site_id else plan.central_instances()
-    return {name: {"binary": i["binary"], "args": i["args"], "files": i["files"]} for name, i in inst.items()}
 
 
 # ============================================================== settings
@@ -417,7 +368,7 @@ def _enroll(body: S.EnrollIn, db: Session):
         raise HTTPException(400, "invalid WireGuard public key")
     if db.query(EdgeDevice).filter(EdgeDevice.wg_public_key == body.wg_public_key).first():
         raise HTTPException(409, "public key already enrolled")
-    used = {d.wg_ip for d in db.query(EdgeDevice).all()} | {c.wg_ip for c in db.query(DispatchConsole).all() if c.wg_ip}
+    used = {d.wg_ip for d in db.query(EdgeDevice).all()}
     secret = secrets.token_urlsafe(32)
     dev = EdgeDevice(site_id=tok.site_id, hostname=body.hostname, serial=body.serial, model=body.model,
                      agent_version=body.agent_version, wg_public_key=body.wg_public_key,
@@ -449,69 +400,6 @@ def enroll_status(body: dict, db: Session = Depends(get_db)):
     if dev.status == "active":
         resp["wireguard"] = _wg_payload(dev)
     return resp
-
-
-# ============================================================== PoC provisioning
-_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-
-
-@router.post("/subscribers/{pk}/poc/activation", dependencies=admin)
-async def poc_activation(pk: int, db: Session = Depends(get_db)):
-    """Enable PoC for a radio ID and issue a one-time activation code (+ QR) for the phone app."""
-    import segno
-    sub = _get_or_404(db, Subscriber, pk)
-    code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(8))
-    sub.poc_enabled = True
-    sub.poc_activation_hash = hash_secret(code)
-    sub.poc_activation_expires = now() + dt.timedelta(hours=24)
-    db.commit()
-    uri = f"keyup://activate?s={settings.public_url}&u={sub.id}&c={code}"
-    await changed()
-    return {"unit": sub.id, "alias": sub.alias, "code": code, "server": settings.public_url, "uri": uri,
-            "expires_at": sub.poc_activation_expires.isoformat() + "Z",
-            "qr_svg": segno.make(uri, error="m").svg_inline(scale=5, dark="#000", light="#fff")}
-
-
-@router.post("/poc/activate")
-def poc_activate(body: S.PocActivateIn, db: Session = Depends(get_db)):
-    """Called by the phone app: trade a one-time activation code for a device token."""
-    from .services.poc import new_token, token_hash
-    sub = db.get(Subscriber, body.unit)
-    code = body.code.strip().upper().replace("-", "").replace(" ", "")
-    if (not sub or not sub.poc_activation_hash or not sub.poc_activation_expires
-            or sub.poc_activation_expires < now() or not verify_secret(code, sub.poc_activation_hash)):
-        time.sleep(1)
-        raise HTTPException(403, "invalid or expired activation code")
-    if not sub.enabled:
-        raise HTTPException(403, "this radio is inhibited")
-    token = new_token()
-    sub.poc_activation_hash, sub.poc_activation_expires = "", None
-    db.add(PocDevice(subscriber_id=sub.id, token_hash=token_hash(token), name=body.device_name[:64],
-                     platform=body.platform[:16], app_version=body.app_version[:16]))
-    db.commit()
-    bus.publish("poc", action="activated", unit=sub.id, alias=sub.alias, platform=body.platform)
-    return {"token": token, "unit": sub.id, "alias": sub.alias, "ws_path": "/poc/ws"}
-
-
-@router.get("/poc/devices", dependencies=admin)
-def poc_devices(db: Session = Depends(get_db)):
-    online = {s["device_id"] for s in (state.poc.status()["sessions"] if state.poc else [])}
-    return [{**d.to_dict(), "online": d.id in online} for d in db.query(PocDevice).order_by(PocDevice.subscriber_id)]
-
-
-@router.post("/poc/devices/{pk}/revoke", dependencies=admin)
-async def poc_revoke(pk: int, db: Session = Depends(get_db)):
-    d = _get_or_404(db, PocDevice, pk)
-    d.revoked = True
-    db.commit()
-    if state.poc:
-        await state.poc.refresh()
-    return {"ok": True}
-
-
-@router.get("/poc/status", dependencies=admin)
-def poc_status():
-    return state.poc.status() if state.poc else {"sessions": [], "emergencies": {}, "disabled": True}
 
 
 # ============================================================== calls & dashboard
@@ -554,7 +442,6 @@ def dashboard(db: Session = Depends(get_db)):
     for s in db.query(Site).order_by(Site.id).all():
         sess = state.ctl.sessions.get(s.id)
         sites.append({**s.to_dict(), "channels": len(s.channels),
-                      "peers_up": sum(1 for p in (state.fne.peers.values() if state.fne else []) if p.get("site_id") == s.id),
                       "mode_mix": sorted({c.mode for c in s.channels}),
                       "codec": sess.codec.name if sess else None,
                       "edge_mode": sess.mode if sess else None})
@@ -574,168 +461,9 @@ def dashboard(db: Session = Depends(get_db)):
         "hourly": hourly,
         "sites": sites,
         "call_processing": state.ctl.status(),
-        "dvm": state.fne.status() if state.fne else None,
-        "poc": state.poc.status() if state.poc else None,
         "transcoder": state.transcoder.status(),
         "sip": state.sip.status() if state.sip else {"enabled": False},
         "wireguard": {"enabled": state.wg.enabled, "interface": state.wg.interface,
                       "server_ip": state.wg.server_ip, "endpoint": state.wg.endpoint,
                       "public_key": state.wg.public_key, "port": state.wg.port},
     }
-
-
-# ============================================================== dispatch consoles (KeyUp fork of dvmconsole)
-def _console_check(db, body: S.ConsoleIn, pk: int | None = None) -> None:
-    if not db.get(Subscriber, body.subscriber_id):
-        raise HTTPException(400, f"radio id {body.subscriber_id} is not a subscriber; add it under Subscriber Radios first")
-    if body.peer_id:
-        if db.query(Channel).filter(Channel.peer_id == body.peer_id).first():
-            raise HTTPException(409, f"peer id {body.peer_id} is used by a channel")
-        other = db.query(DispatchConsole).filter(DispatchConsole.peer_id == body.peer_id).first()
-        if other and other.id != pk:
-            raise HTTPException(409, f"peer id {body.peer_id} is used by console {other.name}")
-
-
-def _console_apply(con: DispatchConsole, body: S.ConsoleIn) -> None:
-    data = body.model_dump()
-    data["talkgroup_ids"] = ",".join(str(t) for t in data["talkgroup_ids"])
-    for k, v in data.items():
-        setattr(con, k, v)
-
-
-def _console_codeplug(db, con: DispatchConsole) -> dict:
-    from .services.consoles import build_codeplug
-    return build_codeplug(dvm.DvmPlan(db), con.to_dict())
-
-
-@router.get("/consoles", dependencies=admin)
-def list_consoles(db: Session = Depends(get_db)):
-    fne_peers = {p["peer_id"]: p for p in ((state.fne.status() if state.fne else {}).get("peers") or [])}
-    wg = state.wg.peer_status() if state.wg else {}
-    plan = dvm.DvmPlan(db)
-    out = []
-    for c in db.query(DispatchConsole).order_by(DispatchConsole.id).all():
-        d = c.to_dict()
-        sub = db.get(Subscriber, c.subscriber_id)
-        d["subscriber_alias"] = sub.alias if sub else "?"
-        d["fne"] = fne_peers.get(c.fne_peer_id)
-        d["online"] = bool(d["fne"] and d["fne"].get("connected", True))
-        d["wg"] = wg.get(c.wg_public_key) if c.wg_public_key else None
-        d["talkgroups"] = [t["id"] for t in plan.console_talkgroups(d)]
-        out.append(d)
-    return out
-
-
-@router.post("/consoles", dependencies=admin)
-async def create_console(body: S.ConsoleIn, db: Session = Depends(get_db)):
-    _console_check(db, body)
-    con = DispatchConsole()
-    _console_apply(con, body)
-    db.add(con)
-    db.commit()
-    await changed()
-    return con.to_dict()
-
-
-@router.put("/consoles/{pk}", dependencies=admin)
-async def update_console(pk: int, body: S.ConsoleIn, db: Session = Depends(get_db)):
-    con = _get_or_404(db, DispatchConsole, pk)
-    _console_check(db, body, pk)
-    _console_apply(con, body)
-    db.commit()
-    await changed()
-    return con.to_dict()
-
-
-@router.delete("/consoles/{pk}", dependencies=admin)
-async def delete_console(pk: int, db: Session = Depends(get_db)):
-    con = _get_or_404(db, DispatchConsole, pk)
-    if con.wg_public_key and state.wg:
-        state.wg.remove_peer(con.wg_public_key)
-    db.delete(con)
-    db.commit()
-    await changed()
-    return {"ok": True}
-
-
-@router.post("/consoles/{pk}/activation", dependencies=admin)
-def console_activation(pk: int, db: Session = Depends(get_db)):
-    """Issue a one-time code that the console app trades for its codeplug, token and WireGuard tunnel."""
-    con = _get_or_404(db, DispatchConsole, pk)
-    secret_part = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(8))
-    con.activation_hash = hash_secret(secret_part)
-    con.activation_expires = now() + dt.timedelta(hours=24)
-    db.commit()
-    return {"console_id": con.id, "name": con.name, "server": settings.public_url,
-            "code": f"{con.id}-{secret_part[:4]}-{secret_part[4:]}",
-            "expires_at": con.activation_expires.isoformat() + "Z"}
-
-
-@router.post("/consoles/{pk}/revoke", dependencies=admin)
-async def console_revoke(pk: int, db: Session = Depends(get_db)):
-    """Log the console out: its token stops working and its WireGuard tunnel is removed."""
-    con = _get_or_404(db, DispatchConsole, pk)
-    if con.wg_public_key and state.wg:
-        state.wg.remove_peer(con.wg_public_key)
-    con.token_hash, con.wg_public_key, con.activation_hash = "", "", ""
-    con.enabled = False
-    db.commit()
-    await changed()
-    bus.publish("console", action="revoked", console=con.id, name=con.name)
-    return con.to_dict()
-
-
-@router.get("/consoles/{pk}/codeplug", dependencies=admin)
-def console_codeplug_admin(pk: int, db: Session = Depends(get_db)):
-    return _console_codeplug(db, _get_or_404(db, DispatchConsole, pk))
-
-
-# ---- called by the console app (public; protected by the activation code / console token)
-@router.post("/console/activate")
-async def console_activate(body: S.ConsoleActivateIn, db: Session = Depends(get_db)):
-    from .services.consoles import wireguard_conf
-    from .services.poc import new_token, token_hash
-    from .services.wireguard import generate_keypair
-    raw = body.code.strip().upper().replace(" ", "")
-    head, _, rest = raw.partition("-")
-    con = db.get(DispatchConsole, int(head)) if head.isdigit() else None
-    code = rest.replace("-", "")
-    if (not con or not con.activation_hash or not con.activation_expires or con.activation_expires < now()
-            or not verify_secret(code, con.activation_hash)):
-        time.sleep(1)
-        raise HTTPException(403, "invalid or expired activation code")
-    with _enroll_lock:
-        if con.wg_public_key and state.wg:
-            state.wg.remove_peer(con.wg_public_key)
-        priv, pub = generate_keypair()
-        if not con.wg_ip:
-            used = {d.wg_ip for d in db.query(EdgeDevice).all()} | {
-                c.wg_ip for c in db.query(DispatchConsole).all() if c.wg_ip}
-            con.wg_ip = state.wg.allocate_ip(used)
-        con.wg_public_key = pub
-        token = new_token()
-        con.token_hash = token_hash(token)
-        con.activation_hash, con.activation_expires = "", None
-        con.enabled = True
-        con.activated_at = con.last_sync = now()
-        db.commit()
-        state.wg.add_peer(pub, con.wg_ip)
-    await changed()
-    cp = _console_codeplug(db, con)
-    bus.publish("console", action="activated", console=con.id, name=con.name, machine=body.machine[:64])
-    return {"token": token, "console_id": con.id, "name": con.name, "server": settings.public_url,
-            "wireguard_conf": wireguard_conf(priv, state.wg.client_config(con.wg_ip), con.name),
-            "tunnel_ip": con.wg_ip, "fne": f"{dvm.DvmPlan(db).fne_host}:{dvm.DvmPlan(db).fne_port}", **cp}
-
-
-@router.get("/console/codeplug")
-def console_codeplug(authorization: str = Header(default=""), db: Session = Depends(get_db)):
-    from .services.poc import token_hash
-    token = authorization.removeprefix("Bearer ").strip()
-    con = db.query(DispatchConsole).filter(DispatchConsole.token_hash == token_hash(token or "-")).first() if token else None
-    if not con or not con.enabled:
-        time.sleep(0.5)
-        raise HTTPException(403, "console not activated, or revoked")
-    con.last_sync = now()
-    db.commit()
-    return {"console_id": con.id, "name": con.name, **_console_codeplug(db, con)}

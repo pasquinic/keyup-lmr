@@ -141,11 +141,8 @@ pages.dashboard = async el => {
   const maxH = Math.max(1, ...Object.values(d.hourly)), maxT = Math.max(1, ...d.top_talkgroups.map(t => t.calls));
   liveCalls = Object.fromEntries(d.call_processing.active_calls.map(c => [c.call_id, c]));
   el.innerHTML = `
-  ${d.dvm && d.system.dvm_license_acknowledged !== "true" ? `<div class="card" style="border-color:var(--warn);margin-bottom:16px"><b style="color:var(--warn)">DVM not started.</b> Acknowledge the DVM license terms on the <a href="#/dvm">DVM Network</a> page.</div>` : ""}
   <div class="grid kpis">
     ${kpi(`${online}/${d.sites.length}`, "Sites online")}
-    ${d.dvm ? kpi(d.dvm.reachable ? `${d.dvm.peers.length}` : pill("down", "offline"), "FNE peers") : ""}
-    ${d.poc ? kpi(d.poc.sessions.length, "PoC phones online") : ""}
     ${kpi(`<span id="kActive">${d.call_processing.active_calls.length}</span>`, "Active calls")}
     ${kpi(d.calls_24h, "Calls · 24h")}
     ${kpi(d.denied_24h, "Denied / busy · 24h")}
@@ -162,16 +159,12 @@ pages.dashboard = async el => {
   <div class="grid three" style="margin-top:16px">
     <div class="card"><h3>Calls per hour (24h)</h3><div class="bars">${Object.entries(d.hourly).map(([h, n]) => `<div style="height:${n / maxH * 100}%" data-t="${h} · ${n}"></div>`).join("")}</div></div>
     <div class="card"><h3>Busiest talkgroups</h3>${d.top_talkgroups.map(t => `<div class="hbar"><span>${esc(t.name)}</span><span class="b" style="width:${t.calls / maxT * 100}%"></span><span class="mono">${t.calls}</span></div>`).join("") || '<div class="empty">No traffic</div>'}</div>
-    ${d.dvm ? `<div class="card"><h3>DVM network</h3><dl class="kv">
-      <dt>FNE</dt><dd>${d.dvm.reachable ? pill("online") : pill("offline")}</dd>
-      <dt>Peers</dt><dd>${d.dvm.peers.length}</dd><dt>Affiliations</dt><dd>${d.dvm.affiliation_count}</dd>
-      <dt>Vocoding</dt><dd>dvmbridge (SIP, analog, cross-mode patches)</dd>
-      <dt>Site trunking</dt><dd>native on the air (dvmhost)</dd></dl><p><a href="#/dvm">DVM network details →</a></p></div>` : `<div class="card"><h3>Transcoding</h3><dl class="kv">
+    <div class="card"><h3>Transcoding</h3><dl class="kv">
       <dt>DVSI vocoders</dt><dd>${d.transcoder.hardware_vocoders.length ? d.transcoder.hardware_vocoders.map(v => esc(v.port + " " + v.product)).join("<br>") : "none (IMBE/AMBE+2 conversions unavailable)"}</dd>
       <dt>Free / leased</dt><dd>${d.transcoder.free} / ${d.transcoder.leased}</dd>
       <dt>Active sessions</dt><dd>${d.transcoder.active_sessions}</dd>
       <dt>Transcoded calls</dt><dd>${d.transcoder.transcoded_calls}</dd>
-      <dt>Passthrough</dt><dd>P25P2 ⇄ DMR ⇄ NXDN (AMBE+2)</dd></dl></div>`}
+      <dt>Passthrough</dt><dd>P25P2 ⇄ DMR ⇄ NXDN (AMBE+2)</dd></dl></div>
     <div class="card"><h3>Call processing</h3><dl class="kv">
       <dt>Granted</dt><dd>${d.call_processing.calls_granted}</dd><dt>Denied</dt><dd>${d.call_processing.calls_denied}</dd>
       <dt>Frames routed</dt><dd id="kFrames">${d.call_processing.frames_routed}</dd><dt>Frames dropped</dt><dd>${d.call_processing.frames_dropped}</dd>
@@ -192,7 +185,7 @@ const siteCard = s => {
   const status = s.edge_mode === "site_trunking" ? "site_trunking" : s.status;
   return `<div class="site ${esc(status)}"><div class="n">${esc(s.id)} · ${esc(s.name)}</div>
   <div style="margin-top:6px">${pill(status)} ${s.mode_mix.map(m => pill(m, "mode")).join(" ")}</div>
-  <div class="meta">${esc(s.location || "")}<br>${s.channels} channel(s)${s.peers_up !== undefined ? ` · ${s.peers_up} on FNE` : ""} · seen ${ago(s.last_seen)}</div></div>`;
+  <div class="meta">${esc(s.location || "")}<br>${s.channels} channel(s) · net codec ${esc(s.codec || "—")} · seen ${ago(s.last_seen)}</div></div>`;
 };
 function drawLive() {
   const box = $("#liveCalls"); if (!box) return;
@@ -226,9 +219,6 @@ function connectLive() {
     else if (e.event === "device") logEvent(`DEVICE ${e.device_id} ${e.status}`, e.ts);
     else if (e.event === "calls_imported") logEvent(`Imported ${e.count} site-trunking call records from site ${e.site_id}`, e.ts);
     else if (e.event === "sip_leg") logEvent(`SIP ${e.caller} ${e.action} on TG ${e.tg}`, e.ts);
-    else if (e.event === "console") logEvent(`Console ${e.name} ${e.action}${e.machine ? " (" + e.machine + ")" : ""}`, e.ts);
-    else if (e.event === "poc") logEvent(`PoC ${e.unit} ${e.alias || ""} ${e.action}${e.platform ? " (" + e.platform + ")" : ""}`, e.ts);
-    else if (e.event === "emergency") { logEvent(`${e.on ? "⚠ EMERGENCY" : "Emergency cleared"} TG ${e.tg} unit ${e.unit} ${e.alias || ""}`, e.ts); showAlarm(e); }
   };
 }
 
@@ -257,10 +247,7 @@ pages.talkgroups = resourcePage({
     {name: "restricted", label: "Restricted: only radios that list this TG may talk", type: "bool", group: "Routing rules"},
     {name: "affiliated_only", label: "Repeat only at sites where a radio on this TG was heard", type: "bool", group: "Routing rules"},
     {name: "parrot", label: "Parrot: echo each transmission back to the talker", type: "bool", group: "Routing rules"},
-    {name: "site_ids", label: "Allowed sites (comma list, blank = all)", placeholder: "1,2", group: "Routing rules"},
-    {name: "dmr_slot", label: "DMR timeslot", type: "number", default: 1, group: "Interconnect"},
-    {name: "allow_poc", label: "Selectable by PoC phones", type: "bool", default: true, group: "Interconnect"},
-    {name: "bridge_mode", label: "Mode for SIP / PoC / analog bridges (DVM)", type: "select", options: [{value: "P25P1", label: "P25"}, {value: "DMR", label: "DMR"}, {value: "ANALOG", label: "Analog"}], default: "P25P1", group: "Interconnect"}],
+    {name: "site_ids", label: "Allowed sites (comma list, blank = all)", placeholder: "1,2", group: "Routing rules"}],
 });
 
 const CHANNEL_FIELDS = [
@@ -280,14 +267,6 @@ const CHANNEL_FIELDS = [
   {name: "signaling", label: "PTT / COR via", type: "select", options: [{value: "gpio", label: "GPIO pins"}, {value: "serial", label: "Serial port RTS (PTT) / CTS (COR)"}], default: "gpio", group: "Edge hardware"},
   {name: "serial_port", label: "Serial port (serial signalling)", placeholder: "/dev/ttyUSB0", group: "Edge hardware"},
   {name: "cor_invert", label: "Invert CTS (serial)", type: "bool", group: "Edge hardware"},
-  {name: "peer_id", label: "FNE peer ID (blank = auto)", type: "number", nullable: true, group: "DVM modem / dvmhost"},
-  {name: "modem_type", label: "Modem", type: "select", options: [{value: "uart", label: "UART (DVM-V1 / hotspot / V.24)"}, {value: "null", label: "Null (lab, no RF)"}], default: "uart", group: "DVM modem / dvmhost"},
-  {name: "modem_mode", label: "Modem mode", type: "select", options: [{value: "air", label: "Air interface (modem)"}, {value: "dfsi", label: "DFSI (V.24 via DVM-V24)"}], default: "air", group: "DVM modem / dvmhost"},
-  {name: "modem_port", label: "Modem / serial port (analog: RTS PTT + CTS COR)", default: "/dev/ttyUSB0", group: "DVM modem / dvmhost"},
-  {name: "modem_speed", label: "Serial speed", type: "number", default: 115200, group: "DVM modem / dvmhost"},
-  {name: "rx_level", label: "Modem RX level %", type: "number", default: 50, group: "DVM modem / dvmhost"},
-  {name: "tx_level", label: "Modem TX level %", type: "number", default: 50, group: "DVM modem / dvmhost"},
-  {name: "power_w", label: "TX power (W, informational)", type: "number", default: 10, group: "DVM modem / dvmhost"},
 ];
 pages.channels = resourcePage({
   path: "channels", listPath: "frequencies", title: "Channel",
@@ -296,8 +275,6 @@ pages.channels = resourcePage({
     {key: "talkgroup_id", label: "TG"}, {key: "codec", label: "Codec"},
     {label: "Band plan", render: r => r.identity !== null && r.identity !== undefined ? `<span class="mono">id ${r.identity} · ch ${r.channel_no}</span>` : '<span class="muted">—</span>'},
     {label: "PTT / COR", render: r => `<span class="mono">${r.signaling === "serial" ? `RTS/CTS ${esc(r.serial_port)}` : `GPIO ${r.ptt_gpio} / ${r.cor_gpio}`}</span>`},
-    {label: "Role", render: r => esc(r.role)},
-    {label: "DVM modem", render: r => `<span class="mono">peer ${esc(r.peer_id ?? "auto")}<br>${esc(r.modem_type)} ${esc(r.modem_mode)} ${esc(r.modem_port)}</span>`},
     {label: "Checks", render: r => r.warnings.length ? `<div class="warnlist">${r.warnings.map(esc).join("<br>")}</div>` : pill("ok", "yes")}],
   fields: CHANNEL_FIELDS,
 });
@@ -308,21 +285,14 @@ pages.subscribers = async el => {
     extraToolbar: `<button class="btn" id="importBtn">Import CSV</button>`,
     columns: [{key: "id", label: "Radio ID"}, {key: "alias", label: "Alias"}, {label: "Mode", render: r => pill(r.mode, "mode")}, {key: "model", label: "Model"},
       {key: "home_site_id", label: "Assigned site"}, {label: "Talkgroups", render: r => r.talkgroup_ids.length ? esc(r.talkgroup_ids.join(", ")) : '<span class="muted">all</span>'},
-      {label: "Last seen", render: r => r.last_seen ? `${ago(r.last_seen)} · ${r.last_site_id ? "site " + esc(r.last_site_id) : "PoC/net"} TG ${esc(r.last_tg_id ?? "")}` : "—"}, {label: "Enabled", render: r => yes(r.enabled)},
-      {label: "PoC", render: r => r.poc_enabled ? pill("yes") : '<span class="muted">—</span>'}],
-    rowActions: r => `<button class="btn sm" data-poc="${esc(r.id)}">PoC QR</button> `,
+      {label: "Last seen", render: r => r.last_seen ? `${ago(r.last_seen)} · site ${esc(r.last_site_id)} TG ${esc(r.last_tg_id ?? "")}` : "—"}, {label: "Enabled", render: r => yes(r.enabled)}],
     fields: [{name: "id", label: "Radio / unit ID", type: "number", required: true, readonly: true}, {name: "alias", label: "Alias", required: true},
       {name: "mode", label: "Mode", type: "select", options: MODES}, {name: "model", label: "Radio model"}, {name: "serial", label: "Serial"},
       {name: "home_site_id", label: "Assigned site / edge device", type: "select", options: "sites", nullable: true, numeric: true},
       {name: "talkgroup_ids", label: "Permitted talkgroups (none = all)", type: "multi", options: "talkgroups", wide: true},
       {name: "enabled", label: "Enabled (inhibit when off)", type: "bool", default: true}, {name: "notify_site_trunking", label: "Send site-trunking data alerts", type: "bool", default: true},
-      {name: "poc_enabled", label: "PoC phone allowed for this radio ID", type: "bool", default: false},
       {name: "notes", label: "Notes", type: "textarea", wide: true}],
   })(el);
-  el.addEventListener("click", async e => {
-    const id = e.target.dataset?.poc;
-    if (id) { e.stopPropagation(); await pocActivation(id); }
-  }, true);
   $("#importBtn", el).onclick = async () => {
     await formModal("Import subscribers (CSV)", [{name: "csv", label: "id,alias,mode,home_site_id,talkgroups(;-separated)", type: "textarea", wide: true, placeholder: "1001,Engine 1,P25P1,1,100;200"}], {}, "Import", async data => {
       const rows = data.csv.trim().split(/\r?\n/).filter(l => l && !/^id,/i.test(l)).map(l => { const [id, alias, mode, home, tgs] = l.split(",").map(s => s.trim());
@@ -392,6 +362,24 @@ pages.sip = async el => {
 };
 
 
+pages.bandplan = resourcePage({
+  path: "bandplan", title: "Band Plan Entry",
+  columns: [{key: "id", label: "Identity"}, {key: "name", label: "Name"}, {label: "Base MHz", render: r => `<span class="mono">${Number(r.base_mhz).toFixed(5)}</span>`},
+    {label: "Spacing", render: r => `${r.spacing_khz} kHz`}, {label: "Input offset", render: r => `${r.offset_mhz >= 0 ? "+" : ""}${r.offset_mhz} MHz`}, {label: "Bandwidth", render: r => `${r.bandwidth_khz} kHz`}],
+  fields: [{name: "id", label: "Identity (0-15)", type: "number", required: true, readonly: true}, {name: "name", label: "Name", placeholder: "UHF 450"},
+    {name: "base_mhz", label: "Base frequency (MHz)", type: "number", required: true}, {name: "spacing_khz", label: "Channel spacing (kHz)", type: "number", default: 6.25},
+    {name: "offset_mhz", label: "Input offset (MHz, RX = TX + offset)", type: "number", default: 5}, {name: "bandwidth_khz", label: "Bandwidth (kHz)", type: "number", default: 12.5}],
+  newDefaults: {spacing_khz: 6.25, offset_mhz: 5, bandwidth_khz: 12.5},
+});
+
+pages.patches = resourcePage({
+  path: "patches", title: "Patch",
+  columns: [{key: "name", label: "Name"}, {label: "Talkgroup A", render: r => `TG ${esc(r.tg_a)}`}, {label: "", render: () => "⇄"},
+    {label: "Talkgroup B", render: r => `TG ${esc(r.tg_b)}`}, {label: "Enabled", render: r => yes(r.enabled)}],
+  fields: [{name: "name", label: "Name", required: true}, {name: "tg_a", label: "Talkgroup A", type: "select", options: "talkgroups", numeric: true},
+    {name: "tg_b", label: "Talkgroup B", type: "select", options: "talkgroups", numeric: true}, {name: "enabled", label: "Enabled", type: "bool", default: true}],
+});
+
 pages.network = async el => {
   const [n, sites] = await Promise.all([api("/network"), api("/sites")]);
   el.innerHTML = `
@@ -437,9 +425,7 @@ pages.settings = async el => {
   const labels = {system_name: "System name", wacn: "WACN (hex)", system_id: "System ID (hex)", require_known_subscriber: "Require known subscriber (true/false)",
     site_trunking_timeout_s: "Site trunking after link loss (s)", site_trunking_announce_interval_s: "Site trunking re-announce interval (s)",
     site_trunking_message: "Site trunking data message", wide_area_message: "Wide-area restored message", default_hang_time_ms: "Default hang time (ms)", max_call_s: "Max call duration (s)",
-    affiliation_timeout_s: "Affiliation timeout (s)", cw_id_interval_s: "CW ID interval per transmitter (s)", parrot_delay_ms: "Parrot echo delay (ms)",
-    call_backend: "Call backend (dvm | native)", dvm_license_acknowledged: "DVM license acknowledged (set on DVM page)", fne_peer_id: "FNE master peer ID",
-    fne_address: "FNE address edges dial (tunnel IP)", fne_port: "FNE port", dmr_net_id: "DMR network ID (hex)"};
+    affiliation_timeout_s: "Affiliation timeout (s)", cw_id_interval_s: "CW ID interval per transmitter (s)", parrot_delay_ms: "Parrot echo delay (ms)"};
   el.innerHTML = `<div class="grid two"><div class="card"><h3>System</h3><form id="sForm" class="formgrid">${Object.entries(s).map(([k, v]) => `<label>${esc(labels[k] || k)}<input name="${esc(k)}" value="${esc(v)}"></label>`).join("")}
     <div class="wide"><button class="btn primary">Save &amp; push to sites</button></div></form></div>
     <div class="card"><h3>Change password</h3><form id="pForm" class="formgrid"><label class="wide">Current<input type="password" name="old"></label><label class="wide">New (8+ chars)<input type="password" name="new"></label><div><button class="btn">Update</button></div></form></div></div>`;
@@ -447,167 +433,8 @@ pages.settings = async el => {
   $("#pForm").onsubmit = async e => { e.preventDefault(); try { await api("/auth/password", {method: "POST", body: Object.fromEntries(new FormData(e.target))}); toast("Password updated"); e.target.reset(); } catch (err) { toast(err.message, true); } };
 };
 
-
-pages.bandplan = resourcePage({
-  path: "idens", title: "Band Plan Entry",
-  columns: [{key: "id", label: "Iden"}, {key: "name", label: "Name"}, {label: "Base MHz", render: r => `<span class="mono">${Number(r.base_mhz).toFixed(5)}</span>`},
-    {label: "Spacing", render: r => `${r.spacing_khz} kHz`}, {label: "Input offset", render: r => `${r.offset_mhz >= 0 ? "+" : ""}${r.offset_mhz} MHz`}, {label: "Bandwidth", render: r => `${r.bandwidth_khz} kHz`}],
-  fields: [{name: "id", label: "Identity (0-15)", type: "number", required: true, readonly: true}, {name: "name", label: "Name", placeholder: "UHF 450"},
-    {name: "base_mhz", label: "Base frequency MHz", type: "number", required: true}, {name: "spacing_khz", label: "Channel spacing kHz", type: "number", default: 6.25},
-    {name: "offset_mhz", label: "Input offset MHz (RX = TX + offset)", type: "number", default: 5}, {name: "bandwidth_khz", label: "Bandwidth kHz", type: "number", default: 12.5}],
-  newDefaults: {spacing_khz: 6.25, offset_mhz: 5, bandwidth_khz: 12.5},
-});
-
-pages.patches = resourcePage({
-  path: "patches", title: "Patch",
-  columns: [{key: "name", label: "Name"}, {label: "Side A", render: r => `${pill(r.mode_a, "mode")} TG ${esc(r.tg_a)}`}, {label: "", render: () => "⇄"},
-    {label: "Side B", render: r => `${pill(r.mode_b, "mode")} TG ${esc(r.tg_b)}`}, {label: "Enabled", render: r => yes(r.enabled)}],
-  fields: [{name: "name", label: "Name", required: true}, {name: "tg_a", label: "Talkgroup A", type: "select", options: "talkgroups", numeric: true},
-    {name: "mode_a", label: "Mode A (DVM bridge)", type: "select", options: [{value: "DMR", label: "DMR"}, {value: "P25P1", label: "P25"}, {value: "ANALOG", label: "Analog"}]},
-    {name: "tg_b", label: "Talkgroup B", type: "select", options: "talkgroups", numeric: true},
-    {name: "mode_b", label: "Mode B (DVM bridge)", type: "select", options: [{value: "P25P1", label: "P25"}, {value: "DMR", label: "DMR"}, {value: "ANALOG", label: "Analog"}]},
-    {name: "enabled", label: "Enabled", type: "bool", default: true}],
-});
-
-const LICENSE_NOTE = "DVMProject software is provided for personal, non-commercial, hobbyist use and must never be used for public safety or life safety critical applications. Acknowledging sets DVM's iAgreeNotToBeStupid flag in every generated config.";
-pages.dvm = async el => {
-  const [d, sites] = await Promise.all([api("/dvm/status"), api("/sites")]);
-  const peers = d.fne?.peers || [];
-  const warns = Object.entries(d.warnings || {}).flatMap(([k, v]) => v.map(m => `${k}: ${m}`));
-  el.innerHTML = `
-  ${d.license_acknowledged ? "" : `<div class="card" style="border-color:var(--warn);margin-bottom:16px"><h3 style="color:var(--warn)">DVM license acknowledgement required</h3>
-    <p>${esc(LICENSE_NOTE)}</p><p class="muted">Until you acknowledge, KeyUp does not start the FNE, bridges or edge dvmhost instances.</p>
-    <button class="btn primary" id="ackBtn">I acknowledge — personal, non-commercial use only</button></div>`}
-  <div class="grid kpis">
-    ${kpi(d.fne?.reachable ? pill("online") : pill("offline"), "FNE")}
-    ${kpi(peers.length, "Peers connected")}
-    ${kpi(d.fne?.affiliation_count ?? 0, "Affiliations")}
-    ${kpi((d.fne?.active_calls || []).length, "Active calls")}
-  </div>
-  <div class="card" style="margin-top:16px"><h3>FNE peers</h3><div class="tablewrap"><table><thead><tr><th>Peer</th><th>Channel / bridge</th><th>Identity</th><th>Software</th><th>Address</th><th>Pings</th><th>Trunking</th></tr></thead><tbody>
-    ${peers.map(p => `<tr><td class="mono">${esc(p.peer_id)}</td><td>${esc(p.label || "unknown peer")}</td><td>${esc(p.identity || "")}</td><td class="muted">${esc(p.software || "")}</td>
-      <td class="mono">${esc(p.address || "")}</td><td>${esc(p.pings ?? "")}</td><td>${p.control_channel ? `voice ch of ${esc(p.control_channel)}` : ""}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">${d.fne?.reachable ? "No peers connected yet" : "FNE not reachable: " + esc(d.fne?.error || "")}</td></tr>`}
-  </tbody></table></div></div>
-  <div class="grid two" style="margin-top:16px">
-    <div class="card"><h3>Configuration checks</h3>${warns.length ? `<div class="warnlist">${warns.map(esc).join("<br>")}</div>` : pill("ok", "yes") + ' <span class="muted">no problems found</span>'}
-      <p class="muted">Central DVM instances: ${d.central_instances.map(esc).join(", ") || "none"}<br>DVM source pinned to <span class="mono">${esc(d.dvm_ref.slice(0, 10))}</span></p></div>
-    <div class="card"><h3>Generated configuration</h3>
-      <div class="toolbar"><select id="pvSite"><option value="">Central (FNE + bridges)</option>${sites.map(s => `<option value="${s.id}">Site ${s.id} · ${esc(s.name)}</option>`).join("")}</select><button class="btn" id="pvGo">Show</button></div>
-      <div id="pvOut" class="muted">Read-only preview of the files KeyUp writes for DVM.</div></div>
-  </div>`;
-  $("#ackBtn", el)?.addEventListener("click", async () => {
-    if (!confirm(LICENSE_NOTE + "\n\nAcknowledge?")) return;
-    await api("/settings", {method: "PUT", body: {dvm_license_acknowledged: "true"}}); toast("Acknowledged — starting DVM"); route();
-  });
-  $("#pvGo", el).onclick = async () => {
-    const sid = $("#pvSite").value, files = await api("/dvm/preview" + (sid ? `?site_id=${sid}` : ""));
-    $("#pvOut").innerHTML = Object.entries(files).map(([name, i]) => `<details><summary class="mono">${esc(name)} — ${esc(i.binary)} ${esc(i.args.join(" "))}</summary>
-      ${Object.entries(i.files).map(([f, c]) => `<p class="mono">${esc(f)}</p><div class="code" style="max-height:300px;overflow:auto">${esc(c)}</div>`).join("")}</details>`).join("") || "Nothing generated for this selection.";
-  };
-};
-
-
-async function pocActivation(unit) {
-  if (!confirm(`Issue a PoC activation code for radio ${unit}? This enables PoC for the radio ID; the code works once and expires in 24 hours.`)) return;
-  try {
-    const a = await api(`/subscribers/${unit}/poc/activation`, {method: "POST"});
-    const m = $("#modal"), f = $("#modalForm");
-    f.innerHTML = `<h2>Activate a phone as radio ${esc(a.unit)} · ${esc(a.alias)}</h2>
-      <div class="qrwrap"><div class="qr">${a.qr_svg}</div>
-      <dl class="kv"><dt>Server</dt><dd>${esc(a.server)}</dd><dt>Radio ID</dt><dd>${esc(a.unit)}</dd>
-      <dt>Code</dt><dd style="font-size:20px;letter-spacing:3px">${esc(a.code)}</dd><dt>Expires</dt><dd>${new Date(a.expires_at).toLocaleString()}</dd></dl></div>
-      <p class="muted">In the KeyUp app tap <b>Scan activation QR code</b>, or enter the server, radio ID and code. The phone then follows the same rules as this radio ID: inhibit, permitted talkgroups and the radio ID lists on the FNE.</p>
-      <div class="formfoot"><button class="btn primary" value="cancel">Done</button></div>`;
-    m.showModal(); f.onsubmit = () => { m.close(); route(); };
-  } catch (err) { toast(err.message, true); }
-}
-
-pages.poc = async el => {
-  const [devs, st] = await Promise.all([api("/poc/devices"), api("/poc/status")]);
-  const subs = Object.fromEntries((await api("/subscribers")).map(s => [s.id, s]));
-  const em = Object.entries(st.emergencies || {});
-  el.innerHTML = `${em.length ? `<div class="card" style="border-color:var(--emerg);margin-bottom:16px"><h3 style="color:var(--emerg)">Active emergencies</h3>
-      ${em.map(([tg, e]) => `<div>TG ${esc(tg)} · unit ${esc(e.src)} (${esc(subs[e.src]?.alias || "")}) since ${new Date(e.ts * 1000).toLocaleTimeString()}</div>`).join("")}</div>` : ""}
-  <div class="grid kpis">${kpi(st.sessions.length, "Phones online")}${kpi(devs.filter(d => !d.revoked).length, "Activated phones")}${kpi(st.sessions.filter(s => s.talking).length, "Transmitting")}</div>
-  <div class="card" style="margin-top:16px"><h3>Online now</h3><div class="tablewrap"><table><thead><tr><th>Radio ID</th><th>Alias</th><th>Platform</th><th>Selected TG</th><th>Scan</th><th>Status</th><th>Connected</th></tr></thead><tbody>
-  ${st.sessions.map(s => `<tr><td class="mono">${esc(s.unit)}</td><td>${esc(s.alias)}</td><td>${esc(s.platform)}</td><td>${esc(s.selected ?? "—")}</td><td>${esc((s.scan || []).join(", ") || "—")}</td>
-    <td>${s.talking ? pill("TX TG " + s.talking, "denied") : pill("idle", "mode")}</td><td>${dur(s.connected_s)}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">No phones connected</td></tr>`}
-  </tbody></table></div></div>
-  <div class="card" style="margin-top:16px"><h3>Activated phones</h3><p class="muted">Issue new activations from <a href="#/subscribers">Subscriber Radios</a> → PoC QR. Revoking logs the phone out immediately.</p>
-  <div class="tablewrap"><table><thead><tr><th>Radio ID</th><th>Alias</th><th>Device</th><th>Platform / app</th><th>Activated</th><th>Last seen</th><th>State</th><th></th></tr></thead><tbody>
-  ${devs.map(d => `<tr><td class="mono">${esc(d.subscriber_id)}</td><td>${esc(subs[d.subscriber_id]?.alias || "")}</td><td>${esc(d.name)}</td><td>${esc(d.platform)} ${esc(d.app_version)}</td>
-    <td>${ago(d.created_at)}</td><td>${ago(d.last_seen)}</td><td>${d.revoked ? pill("revoked") : d.online ? pill("online") : pill("offline")}</td>
-    <td class="actions">${d.revoked ? "" : `<button class="btn sm danger" data-revoke="${d.id}">Revoke</button>`}</td></tr>`).join("") || `<tr><td colspan="8" class="empty">No phones activated yet</td></tr>`}
-  </tbody></table></div></div>`;
-  el.onclick = async e => {
-    const id = e.target.dataset.revoke;
-    if (id && confirm("Revoke this phone? It is disconnected immediately and needs a new activation.")) {
-      await api(`/poc/devices/${id}/revoke`, {method: "POST"}); toast("Revoked"); route();
-    }
-  };
-};
-
-pages.consoles = async el => {
-  await resourcePage({
-    path: "consoles", title: "Dispatch Console",
-    columns: [{key: "id", label: "#"}, {key: "name", label: "Name"},
-      {label: "Radio ID", render: r => `<span class="mono">${esc(r.subscriber_id)}</span> ${esc(r.subscriber_alias)}`},
-      {label: "FNE peer", render: r => `<span class="mono">${esc(r.fne_peer_id)}</span>`},
-      {label: "Talkgroups", render: r => r.talkgroups.length ? esc(r.talkgroups.join(", ")) : '<span class="muted">none permitted</span>'},
-      {label: "Rights", render: r => [r.can_inhibit && "inhibit", r.call_priority && "priority"].filter(Boolean).join(" · ") || '<span class="muted">—</span>'},
-      {label: "Tunnel", render: r => r.wg_ip ? `<span class="mono">${esc(r.wg_ip)}</span>${r.wg?.latest_handshake ? " · " + ago(new Date(r.wg.latest_handshake * 1000).toISOString()) : ""}` : '<span class="muted">—</span>'},
-      {label: "Status", render: r => !r.enabled ? pill("disabled") : r.online ? pill("online") : r.activated ? pill("offline") : pill("not activated", "mode")},
-      {label: "Last sync", render: r => r.last_sync ? ago(r.last_sync) : "—"}],
-    rowActions: r => `<button class="btn sm" data-cact="${esc(r.id)}">Activate</button> ${r.activated ? `<button class="btn sm danger" data-crev="${esc(r.id)}">Revoke</button> ` : ""}`,
-    fields: [{name: "name", label: "Name (shown on the FNE)", required: true, placeholder: "Dispatch 1"},
-      {name: "subscriber_id", label: "Transmits as radio ID", type: "select", options: "subscribers", numeric: true},
-      {name: "talkgroup_ids", label: "Talkgroups on the console (none = every talkgroup the radio ID may use)", type: "multi", options: "talkgroups", wide: true},
-      {name: "can_inhibit", label: "May inhibit / uninhibit radios", type: "bool", default: true},
-      {name: "call_priority", label: "Call priority over radios", type: "bool", default: true},
-      {name: "enabled", label: "Enabled", type: "bool", default: true},
-      {name: "peer_id", label: "FNE peer ID (blank = 9300000 + console #)", type: "number", nullable: true},
-      {name: "notes", label: "Notes", type: "textarea", wide: true}],
-  })(el);
-  el.insertAdjacentHTML("afterbegin", `<div class="card" style="margin-bottom:16px"><h3>KeyUp Dispatch Console for Windows</h3>
-    <p class="muted">Each console is a PC on the FNE as its own peer, transmitting as the chosen radio ID under the same talkgroup rules as a radio.
-    Install the console and <a href="https://www.wireguard.com/install/" target="_blank" rel="noopener">WireGuard for Windows</a> on the PC, press <b>Activate</b> here,
-    then in the console choose <b>File → Connect to KeyUp server</b> and enter the server address and code. Talkgroup and alias changes reach the console on its next start or <b>File → Sync with KeyUp</b>.</p></div>`);
-  el.addEventListener("click", async e => {
-    const act = e.target.dataset?.cact, rev = e.target.dataset?.crev;
-    if (act) { e.stopPropagation(); await consoleActivation(act); }
-    if (rev) {
-      e.stopPropagation();
-      if (!confirm("Revoke this console? Its tunnel and login stop working immediately and it is disabled; activate it again to reconnect.")) return;
-      try { await api(`/consoles/${rev}/revoke`, {method: "POST"}); toast("Revoked"); route(); } catch (err) { toast(err.message, true); }
-    }
-  }, true);
-};
-
-async function consoleActivation(id) {
-  try {
-    const a = await api(`/consoles/${id}/activation`, {method: "POST"});
-    const m = $("#modal"), f = $("#modalForm");
-    f.innerHTML = `<h2>Activate console ${esc(a.name)}</h2>
-      <dl class="kv"><dt>Server</dt><dd class="mono">${esc(a.server)}</dd>
-      <dt>Code</dt><dd style="font-size:22px;letter-spacing:3px" class="mono">${esc(a.code)}</dd><dt>Expires</dt><dd>${new Date(a.expires_at).toLocaleString()}</dd></dl>
-      <ol class="muted"><li>In the KeyUp Dispatch Console choose <b>File → Connect to KeyUp server…</b> and enter the server and code.</li>
-      <li>The console saves a WireGuard tunnel file and opens its folder: in WireGuard for Windows choose <b>Import tunnel(s) from file</b>, pick <span class="mono">keyup-wireguard.conf</span> and <b>Activate</b>.</li>
-      <li>The console connects to the FNE through the tunnel. The code works once; activating again replaces the tunnel.</li></ol>
-      <div class="formfoot"><button class="btn primary" value="cancel">Done</button></div>`;
-    m.showModal(); f.onsubmit = () => { m.close(); route(); };
-  } catch (err) { toast(err.message, true); }
-}
-
-function showAlarm(e) {
-  const a = $("#alarm");
-  if (!e.on) { a.classList.add("hidden"); return; }
-  a.innerHTML = `⚠ EMERGENCY — TG ${esc(e.tg)} · unit ${esc(e.unit)} ${esc(e.alias || "")} (${esc(e.via || "radio")}) <button class="btn sm">Acknowledge</button>`;
-  a.classList.remove("hidden");
-  a.querySelector("button").onclick = () => a.classList.add("hidden");
-}
-
 // ------------------------------------------------------------------ router
-const TITLES = {network: "Network", poc: "PoC Phones (Cellular Subscribers)", consoles: "Dispatch Consoles", dashboard: "Dashboard", dvm: "DVM Network (FNE)", bandplan: "Band Plan (Iden Table)", patches: "Talkgroup Patches", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
+const TITLES = {network: "Network", bandplan: "Band Plan", patches: "Talkgroup Patches", dashboard: "Dashboard", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
   subscribers: "Subscriber Radios", sip: "SIP Interconnect", calls: "Call History", settings: "System Settings"};
 async function route() {
   const page = (location.hash.slice(2).split("?")[0]) || "dashboard";

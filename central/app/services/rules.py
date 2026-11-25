@@ -93,9 +93,8 @@ class Affiliations:
 
 # ====================================================================== configuration checks
 def config_checks(sites: list[dict], channels: list[dict], tgs: list[dict], patches: list[dict],
-                  plan: list[dict], devices: list[dict], backend: str = "native") -> list[dict]:
-    """Human-readable problems an operator should fix: [{scope, message}].
-    With the DVM backend, digital channels are modems (no GPIO, no fixed talkgroup) so those checks are skipped."""
+                  plan: list[dict], devices: list[dict]) -> list[dict]:
+    """Human-readable problems an operator should fix: [{scope, message}]."""
     out: list[dict] = []
     site_ids = {s["id"] for s in sites}
     tg_ids = {t["id"] for t in tgs}
@@ -107,8 +106,7 @@ def config_checks(sites: list[dict], channels: list[dict], tgs: list[dict], patc
         scope = f"channel {c['name']} (site {c['site_id']})"
         if not c.get("enabled"):
             continue
-        digital_modem = backend == "dvm" and c.get("mode") != "ANALOG"
-        if c.get("role", "voice") == "voice" and not c.get("talkgroup_id") and not digital_modem:
+        if c.get("role", "voice") == "voice" and not c.get("talkgroup_id"):
             add(scope, "voice channel has no talkgroup bound; it will never be keyed")
         if plan:
             for p in locate_channel(c.get("tx_mhz") or 0, c.get("rx_mhz") or 0, plan).problems:
@@ -117,8 +115,6 @@ def config_checks(sites: list[dict], channels: list[dict], tgs: list[dict], patc
             add(scope, "serial signalling selected but no serial port set")
     taken: dict[tuple, str] = {}
     for c in channels:
-        if backend == "dvm":
-            break
         if c.get("enabled") and c.get("signaling", "gpio") == "gpio":
             for pin in (c.get("ptt_gpio"), c.get("cor_gpio")):
                 k = (c["site_id"], pin)
