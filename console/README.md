@@ -26,15 +26,21 @@ The console then brings up its tunnel. Only traffic to the KeyUp server goes thr
 | | |
 |---|---|
 | **Zones** | One tab per zone. Each tile is a talkgroup. |
-| **Monitor** | Hear the talkgroup. Its volume slider sets how loud. |
+| **Monitor** | Hear the talkgroup. Its volume slider sets how loud; the meter above it shows the receive level. |
+| **☆ / ★** | Priority marker. While a starred talkgroup is active, the others get quieter (set how much in **Settings…**). |
+| **Auto / L / R / L+R** | Which ear the talkgroup plays in. **Auto** follows the Selected / Unselected routing in **Settings…**. |
 | **Select** (or click the tile) | The talkgroup the big PTT button and the PTT key use. |
 | **PTT** on a tile | Hold to talk on that talkgroup straight away. |
 | **PTT key** | Space by default (**Settings…**). Hold to talk on the selected talkgroup. |
 | **Inhibit…** | Inhibit or uninhibit a radio ID system-wide (radios, phones and consoles using it). |
-| **Patch…** | Link two talkgroups, or unlink them. |
+| **Patch…** | Tick two or more talkgroups and patch them together; add talkgroups to a patch, take them out, or unpatch. |
 | **Emergency bar** | Appears on an emergency, with tones. **Acknowledge / clear** clears it everywhere. |
 
-A busy talkgroup gives a deny tone. A console with **call priority** talks over radios, but not over emergencies.
+**Bottom bar:** the **RX** meter shows the mixed audio going to your speakers, the **TX** meter your microphone while you transmit. **Master**, **Select**, **Unselect** and **Mic** set the main levels.
+
+**Settings… → Audio routing:** selected audio (the talkgroup you talk on, plus tones) and unselected audio (every other monitored talkgroup) each go to a device and an ear, e.g. selected in the headset and unselected on a desk speaker, or selected left and unselected right. **Tones:** turn TX tones (talk permit, busy / deny) and RX tones (emergency alert) on or off, and set their volume.
+
+A busy talkgroup gives a deny tone (when TX tones are on). A console with **call priority** talks over radios, but not over emergencies.
 
 ## Files
 

@@ -24,6 +24,9 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\KeyUpConsole.exe
+SetupIconFile=keyup.ico
+WizardSmallImageFile=wizard-small.bmp
+WizardImageFile=wizard-large.bmp
 MinVersion=10.0.17763
 
 [Tasks]

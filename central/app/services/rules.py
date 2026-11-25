@@ -41,6 +41,15 @@ def locate_channel(tx_mhz: float, rx_mhz: float, plan: list[dict]) -> ChannelSlo
 
 
 # ====================================================================== talkgroup links (patches)
+def patch_members(p: dict) -> list[int]:
+    """Member talkgroups of a patch row (multi-talkgroup, or a legacy A/B pair)."""
+    out: list[int] = []
+    for tg in (p.get("talkgroups") or [p.get("tg_a"), p.get("tg_b")]):
+        if tg and int(tg) not in out:
+            out.append(int(tg))
+    return out
+
+
 def link_groups(patches: list[dict]) -> dict[int, frozenset[int]]:
     """Talkgroup -> every talkgroup it is (transitively) patched with, itself included."""
     parent: dict[int, int] = {}
@@ -53,8 +62,11 @@ def link_groups(patches: list[dict]) -> dict[int, frozenset[int]]:
         return x
 
     for p in patches:
-        if p.get("enabled", True) and p["tg_a"] != p["tg_b"]:
-            parent[root(p["tg_a"])] = root(p["tg_b"])
+        if not p.get("enabled", True):
+            continue
+        tgs = patch_members(p)
+        for tg in tgs[1:]:
+            parent[root(tg)] = root(tgs[0])
     members: dict[int, set[int]] = {}
     for tg in list(parent):
         members.setdefault(root(tg), set()).add(tg)
@@ -155,11 +167,12 @@ def config_checks(sites: list[dict], channels: list[dict], tgs: list[dict], patc
         if t.get("parrot") and t.get("allow_sip"):
             add(f"talkgroup {t['id']}", "parrot talkgroups echo SIP callers too")
     for p in patches:
-        for tg in (p["tg_a"], p["tg_b"]):
+        tgs = patch_members(p)
+        for tg in tgs:
             if tg not in tg_ids:
                 add(f"patch {p['name']}", f"talkgroup {tg} does not exist")
-        if p["tg_a"] == p["tg_b"]:
-            add(f"patch {p['name']}", "patches a talkgroup to itself")
+        if len(tgs) < 2:
+            add(f"patch {p['name']}", "needs at least two different talkgroups")
     active = {d["site_id"] for d in devices if d.get("status") == "active"}
     for s in sites:
         if s.get("enabled") and s["id"] not in active:

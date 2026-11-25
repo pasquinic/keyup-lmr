@@ -123,6 +123,25 @@ def main():
         assert calls[0]["talkgroup_id"] == 100 and calls[0]["result"] == "granted"
         print("ok  patch: a call on TG 100 was heard on TG 200 channels at both sites")
 
+        pid = req("GET", "/api/patches")[0]["id"]
+        req("PUT", f"/api/patches/{pid}", {"name": "Fire-PW-Ops", "talkgroups": [100, 200, 300]})
+        time.sleep(1)
+        b = snapshot()
+        key(2, "S-PW", 1.0, 1001)
+        idle()
+        d = delta(b)
+        assert all(d.get(k, 0) >= 40 for k in [(1, "N-FD"), (1, "N-PW"), (1, "N-OPS"), (2, "S-FD")]), d
+        assert (2, "S-OPS") not in d, d          # TG 300 is limited to site 1, even when patched
+        try:
+            req("PUT", f"/api/patches/{pid}", {"name": "bad", "talkgroups": [100]})
+            raise AssertionError("one-talkgroup patch accepted")
+        except urllib.error.HTTPError as e:
+            assert e.code == 422
+        req("PUT", f"/api/patches/{pid}", {"name": "Fire-PW", "talkgroups": [100, 200]})
+        time.sleep(1)
+        print("ok  multi-talkgroup patch: a call on TG 200 was heard on TG 100 and 300 (site limit kept), "
+              "one-talkgroup patch refused")
+
         key(2, "S-OPS", 0.5, 1001)
         wait(lambda: any(c["result"] == "denied:site_not_permitted" for c in req("GET", "/api/calls")), 10, "site deny")
         time.sleep(1.5)  # let S-OPS finish its own deny tone

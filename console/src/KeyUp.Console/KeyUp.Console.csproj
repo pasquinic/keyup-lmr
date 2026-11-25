@@ -12,6 +12,7 @@
     <RootNamespace>KeyUp.Console</RootNamespace>
     <StartupObject>KeyUp.Console.Program</StartupObject>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\keyup.ico</ApplicationIcon>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <Version>1.0.0</Version>
@@ -23,6 +24,10 @@
   <ItemGroup>
     <ProjectReference Include="../KeyUp.Console.Core/KeyUp.Console.Core.csproj" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Assets\keyup.ico" />
+    <Resource Include="Assets\keyup-96.png" />
   </ItemGroup>
   <ItemGroup>
     <!-- the official WireGuardNT DLL (download.wireguard.com), placed here by the build -->

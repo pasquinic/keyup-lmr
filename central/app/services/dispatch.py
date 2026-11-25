@@ -12,7 +12,10 @@ over HTTPS (wss://<server>), with the same protocol:
     {"t":"monitor","tgs":[...]}                          talkgroups whose audio the console wants
     {"t":"ptt","on":true,"tg","emergency"} / {"t":"ptt","on":false}
     {"t":"inhibit","unit","on"}                          (may inhibit) disable / re-enable a radio ID
-    {"t":"patch","tgs":[a,b],"on"}                       (may patch) link two talkgroups / unlink
+    {"t":"patch","tgs":[a,b,...],"on":true,"name"?}      (may patch) patch two or more talkgroups together
+    {"t":"patch","id":n,"tgs":[c,...],"on":true}         add talkgroups to patch n
+    {"t":"patch","id":n,"on":false}                      remove patch n
+    {"t":"patch","tgs":[c,...],"on":false}               take these talkgroups out of every patch
     {"t":"emergency_clear","tg"}
     {"t":"ping","ts"}
     binary 0x01 + N*160 bytes G.711 mu-law (20 ms frames)
@@ -39,6 +42,7 @@ from lmrcommon.protocol import FrameType, Msg, VoiceFrame
 
 from ..db import session_scope
 from ..models import DispatchConsole, Subscriber, TalkgroupPatch, now
+from .rules import patch_members
 from .call_controller import Endpoint, get_system_settings
 from .events import bus
 from .poc import token_hash
@@ -177,7 +181,8 @@ class DispatchGateway:
 
     def _patches(self) -> list[dict]:
         with session_scope() as db:
-            return [p.to_dict() for p in db.query(TalkgroupPatch).order_by(TalkgroupPatch.id)]
+            return [{**d, "talkgroups": patch_members(d)} for d in
+                    (p.to_dict() for p in db.query(TalkgroupPatch).order_by(TalkgroupPatch.id))]
 
     def _profile(self, s: ConsoleSession, kind: str) -> dict:
         with session_scope() as db:
@@ -268,7 +273,9 @@ class DispatchGateway:
         elif t == "inhibit":
             await self._inhibit(s, int(m.get("unit") or 0), bool(m.get("on", True)))
         elif t == "patch":
-            await self._patch(s, [int(x) for x in m.get("tgs") or []], bool(m.get("on", True)))
+            pid = m.get("id")
+            await self._patch(s, [int(x) for x in m.get("tgs") or []], bool(m.get("on", True)),
+                              int(pid) if pid not in (None, "") else None, str(m.get("name") or "")[:64])
         elif t == "emergency_clear":
             tg = int(m.get("tg") or 0)
             if self.poc and tg in self.poc.emergency:
@@ -318,19 +325,60 @@ class DispatchGateway:
             log.warning("console %s %s radio %s", s.console["name"], "inhibited" if on else "uninhibited", unit)
             await self._changed()
 
-    async def _patch(self, s: ConsoleSession, tgs: list[int], on: bool) -> None:
-        if not s.console.get("can_patch") or len(tgs) != 2 or any(t not in s.talkgroups for t in tgs):
-            await s.send({"t": "patch_result", "ok": False, "reason": "not_allowed"})
-            return
-        a, b = sorted(tgs)
+    async def _patch(self, s: ConsoleSession, tgs: list[int], on: bool, pid: int | None = None,
+                     name: str = "") -> None:
+        tgs = list(dict.fromkeys(tgs))
+
+        async def fail(reason: str) -> None:
+            await s.send({"t": "patch_result", "ok": False, "reason": reason})
+
+        if not s.console.get("can_patch") or any(t not in s.talkgroups for t in tgs):
+            return await fail("not_allowed")
+        result: dict = {"t": "patch_result", "ok": True, "on": on}
         with session_scope() as db:
-            q = db.query(TalkgroupPatch).filter(TalkgroupPatch.tg_a.in_([a, b]), TalkgroupPatch.tg_b.in_([a, b]))
-            if on and not q.first():
-                db.add(TalkgroupPatch(name=f"Console {s.console['name']}"[:64], tg_a=a, tg_b=b, enabled=True))
-            elif not on:
-                for p in q.all():
+            if pid is not None:
+                p = db.get(TalkgroupPatch, pid)
+                if p is None:
+                    return await fail("no_such_patch")
+                members = patch_members(p.to_dict())
+                if any(t not in s.talkgroups for t in members):
+                    return await fail("not_allowed")      # it links talkgroups this console can't see
+                if on:
+                    members += [t for t in tgs if t not in members]
+                    p.talkgroups, p.tg_a, p.tg_b = members, members[0], members[1]
+                    result.update(id=p.id, tgs=members)
+                else:
                     db.delete(p)
-        bus.publish("patch", tgs=[a, b], on=on, by=s.console["name"])
+                    result.update(id=pid, tgs=members)
+            elif on:
+                if len(tgs) < 2:
+                    return await fail("need_two")
+                for p in db.query(TalkgroupPatch).all():
+                    if set(patch_members(p.to_dict())) == set(tgs):
+                        p.enabled = True
+                        result.update(id=p.id, tgs=tgs)
+                        break
+                else:
+                    p = TalkgroupPatch(name=name or f"Console {s.console['name']}"[:64], talkgroups=tgs,
+                                       tg_a=tgs[0], tg_b=tgs[1], enabled=True)
+                    db.add(p)
+                    db.flush()
+                    result.update(id=p.id, tgs=tgs)
+            else:
+                if not tgs:
+                    return await fail("need_talkgroups")
+                for p in db.query(TalkgroupPatch).all():
+                    members = patch_members(p.to_dict())
+                    if not set(tgs) & set(members):
+                        continue
+                    rest = [t for t in members if t not in tgs]
+                    if len(rest) < 2:
+                        db.delete(p)
+                    else:
+                        p.talkgroups, p.tg_a, p.tg_b = rest, rest[0], rest[1]
+                result.update(tgs=tgs)
+        bus.publish("patch", tgs=result.get("tgs", tgs), on=on, by=s.console["name"])
+        await s.send(result)
         await self._changed()
 
     async def _changed(self) -> None:

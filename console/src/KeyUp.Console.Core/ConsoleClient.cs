@@ -9,7 +9,8 @@ namespace KeyUp.Console.Core;
 
 public sealed record Talkgroup(int Id, string Name, int Priority, bool Emergency);
 public sealed record Zone(int Id, string Name, string? Color, int[] Talkgroups);
-public sealed record Patch(int Id, string Name, int TgA, int TgB, bool Enabled);
+/// <summary>Two or more talkgroups linked together.</summary>
+public sealed record Patch(int Id, string Name, int[] Talkgroups, bool Enabled);
 public sealed record Rights(bool Inhibit, bool Priority, bool Patch);
 
 public sealed class Profile
@@ -56,6 +57,7 @@ public sealed class ConsoleClient : IAsyncDisposable
     public event Action<int, string>? TxEnded;                       // tg, reason
     public event Action<int, int, string, bool>? Emergency;          // tg, src, alias, on
     public event Action<int, bool, bool, string>? InhibitResult;     // unit, on, ok, reason
+    public event Action<bool, string>? PatchResult;                  // ok, reason
     public event Action<string>? AuthFailed;
     public event Action<string>? Disconnected;
 
@@ -86,7 +88,13 @@ public sealed class ConsoleClient : IAsyncDisposable
     public Task PttOnAsync(int tg, bool emergency = false) => SendJsonAsync(new { t = "ptt", on = true, tg, emergency });
     public Task PttOffAsync() => SendJsonAsync(new { t = "ptt", on = false });
     public Task InhibitAsync(int unit, bool on) => SendJsonAsync(new { t = "inhibit", unit, on });
-    public Task PatchAsync(int a, int b, bool on) => SendJsonAsync(new { t = "patch", tgs = new[] { a, b }, on });
+    /// <summary>Patch talkgroups together (a new patch, or added to patch <paramref name="id"/>), or with
+    /// on = false take them out of every patch / remove patch <paramref name="id"/>.</summary>
+    public Task PatchAsync(IEnumerable<int> tgs, bool on, int? id = null, string? name = null) =>
+        SendJsonAsync(new Dictionary<string, object?>
+        {
+            ["t"] = "patch", ["tgs"] = tgs.Distinct().ToArray(), ["on"] = on, ["id"] = id, ["name"] = name ?? "",
+        });
     public Task ClearEmergencyAsync(int tg) => SendJsonAsync(new { t = "emergency_clear", tg });
 
     /// <summary>Send whole 20 ms mu-law frames (160 bytes each).</summary>
@@ -190,6 +198,7 @@ public sealed class ConsoleClient : IAsyncDisposable
             case "emergency": Emergency?.Invoke(Int(m, "tg"), Int(m, "src"), Str(m, "alias") ?? "", Bool(m, "on", true)); break;
             case "inhibit_result":
                 InhibitResult?.Invoke(Int(m, "unit"), Bool(m, "on"), Bool(m, "ok"), Str(m, "reason") ?? ""); break;
+            case "patch_result": PatchResult?.Invoke(Bool(m, "ok"), Str(m, "reason") ?? ""); break;
             case "auth_fail": AuthFailed?.Invoke(Str(m, "reason") ?? "refused"); break;
         }
     }
@@ -214,7 +223,13 @@ public sealed class ConsoleClient : IAsyncDisposable
                 z.GetProperty("talkgroups").EnumerateArray().Select(x => x.GetInt32()).ToArray()));
         if (m.TryGetProperty("patches", out var pa))
             foreach (var x in pa.EnumerateArray())
-                p.Patches.Add(new Patch(Int(x, "id"), Str(x, "name") ?? "", Int(x, "tg_a"), Int(x, "tg_b"), Bool(x, "enabled", true)));
+            {
+                var members = x.TryGetProperty("talkgroups", out var tl) && tl.ValueKind == JsonValueKind.Array
+                    ? tl.EnumerateArray().Where(v => v.ValueKind == JsonValueKind.Number).Select(v => v.GetInt32()).ToArray()
+                    : Array.Empty<int>();
+                if (members.Length < 2) members = new[] { Int(x, "tg_a"), Int(x, "tg_b") }.Where(t => t != 0).Distinct().ToArray();
+                p.Patches.Add(new Patch(Int(x, "id"), Str(x, "name") ?? "", members, Bool(x, "enabled", true)));
+            }
         if (m.TryGetProperty("emergencies", out var em) && em.ValueKind == JsonValueKind.Object)
             foreach (var e in em.EnumerateObject())
                 if (int.TryParse(e.Name, out var tg))

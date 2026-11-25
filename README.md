@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/brand/keyup-logo.png" alt="KeyUp" width="520"></p>
+
 # KeyUp
 
 **Distributed LMR trunking. Key up anywhere.**
@@ -42,7 +44,9 @@ All code in this repository is KeyUp's own. DVMProject's published documentation
 - Zones can be exported as CSV for programming radios.
 
 **Dispatch with the Windows console** (`console/`, see `console/README.md`)
-- A native Windows app (C#, .NET 8, WPF), one tab per zone and a tile per talkgroup: monitor with per-tile volume, select, per-tile PTT plus a PTT key, who-is-talking, emergency banner with acknowledge / clear, radio inhibit / uninhibit, talkgroup patches, and a call and event log.
+- A native Windows app (C#, .NET 8, WPF), one tab per zone and a tile per talkgroup: monitor with per-tile volume and a receive VU meter, select, per-tile PTT plus a PTT key, who-is-talking, emergency banner with acknowledge / clear, radio inhibit / uninhibit, multi-talkgroup patches, and a call and event log.
+- **Priority markers:** star a talkgroup; while it is active, other talkgroups duck (6–24 dB, or mute).
+- **Audio:** RX (mixed) and TX (mic) VU meters, master / selected / unselected / mic levels on the main screen. Selected and unselected audio each go to a device and an ear (left, right or both), and each talkgroup can override its ear. TX tones (talk permit, busy) and RX tones (emergency alert) can each be turned off.
 - **WireGuard is built in.** Activation gives the console its own tunnel, run by a small Windows service (the **KeyUp Tunnel** service) using the official WireGuardNT driver, so no separate WireGuard install is needed and the console itself runs without administrator rights. If the tunnel isn't up, it falls back to HTTPS.
 - Activated with a one-time code from **Dispatch Consoles** in the web UI. Secrets are stored with Windows DPAPI.
 - Installer and portable zip are built by GitHub Actions (**Console · Windows build** workflow).
@@ -85,7 +89,7 @@ All code in this repository is KeyUp's own. DVMProject's published documentation
   - **Allowed sites:** the talkgroup is refused and not routed anywhere else.
   - **Affiliated only:** the talkgroup is repeated only at sites where a radio was recently heard on it. Edit the window under System Settings, `affiliation_timeout_s`.
   - **Parrot:** each transmission is echoed back to the talker's channel, for coverage and audio checks.
-- **Talkgroup patches:** link two talkgroups so a call on either is heard on both. Patches chain (A⇄B, B⇄C), hold the floor on every linked talkgroup, and cross modes, because the router transcodes per site.
+- **Talkgroup patches:** link two or more talkgroups so a call on any of them is heard on all. Patches chain (A⇄B, B⇄C), hold the floor on every linked talkgroup, keep each talkgroup's site limits, and cross modes, because the router transcodes per site. Dispatch consoles can create patches, add or remove talkgroups, and unpatch.
 - **Network page:**
   - every connected edge, with live carrier and transmit state per channel;
   - the affiliation table;
@@ -180,6 +184,7 @@ central/app/      FastAPI server: models, API, call router, transcoder, zones, P
                   shipper, SIP UA, WireGuard, SIP gateway, web UI
 edge/lmr_edge/    Pi agent: enrollment, links, GPIO/ALSA and serial radios, packet channels, site trunking
 console/          Windows dispatch console (C#/.NET 8), tunnel service, Inno Setup installer
+assets/brand/     KeyUp logo (SVG masters + PNG renders)
 mobile/           PoC app (Expo / React Native)
 asterisk/         Asterisk container + PJSIP/ARI config
 deploy/Caddyfile  TLS reverse proxy

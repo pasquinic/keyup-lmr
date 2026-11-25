@@ -68,7 +68,7 @@ async def poc_checks():
     assert pa["t"] == "auth_ok" and pb["t"] == "auth_ok", (pa, pb)
     # zones: 1001 may use 100 and 200 (restricted, listed); "Ops" zone first by position
     assert [(z["name"], z["talkgroups"]) for z in pa["zones"]] == [("Ops", [100]), ("Admin", [200])], pa["zones"]
-    assert [(z["name"], z["talkgroups"]) for z in pb["zones"]] == [("Ops", [100, 300])], pb["zones"]  # 200 restricted
+    assert [(z["name"], z["talkgroups"]) for z in pb["zones"]] == [("Ops", [100, 300, 400])], pb["zones"]  # 200 restricted
     await a.select(100)
     await b.select(100)
 
@@ -244,9 +244,27 @@ async def console_checks():
                 return p
         raise AssertionError("no matching profile")
     await c.send({"t": "patch", "tgs": [100, 300], "on": True})
-    await profile_where(lambda p: any({x["tg_a"], x["tg_b"]} == {100, 300} for x in p["patches"]))
-    assert any({x["tg_a"], x["tg_b"]} == {100, 300} for x in req("GET", "/api/patches"))
-    await c.send({"t": "patch", "tgs": [100, 300], "on": False})
+    res = await c.wait_event("patch_result")
+    assert res["ok"] and res["tgs"] == [100, 300], res
+    await profile_where(lambda p: any(set(x["talkgroups"]) == {100, 300} for x in p["patches"]))
+    # add a third talkgroup to the same patch: a call on 400 is heard on 100 and 300
+    await c.send({"t": "patch", "id": res["id"], "tgs": [400], "on": True})
+    assert (await c.wait_event("patch_result"))["tgs"] == [100, 300, 400]
+    await profile_where(lambda p: any(set(x["talkgroups"]) == {100, 300, 400} for x in p["patches"]))
+    # take one talkgroup out: the other two stay patched
+    await c.send({"t": "patch", "tgs": [300], "on": False})
+    assert (await c.wait_event("patch_result"))["ok"]
+    await profile_where(lambda p: any(set(x["talkgroups"]) == {100, 400} for x in p["patches"]))
+    await c.send({"t": "patch", "id": res["id"], "on": False})
+    assert (await c.wait_event("patch_result"))["ok"]
+    await profile_where(lambda p: not p["patches"])
+    # a three-way patch in one go, and one with a talkgroup the console may not use
+    await c.send({"t": "patch", "tgs": [100, 300, 400], "on": True, "name": "All ops"})
+    res = await c.wait_event("patch_result")
+    assert res["ok"] and next(x for x in req("GET", "/api/patches"))["name"] == "All ops", res
+    await c.send({"t": "patch", "tgs": [100, 200], "on": True})
+    assert (await c.wait_event("patch_result"))["reason"] == "not_allowed"
+    await c.send({"t": "patch", "id": res["id"], "on": False})
     await profile_where(lambda p: not p["patches"])
     # shown online with its transport, then revoked
     row = next(x for x in req("GET", "/api/consoles") if x["id"] == con["id"])
@@ -256,7 +274,7 @@ async def console_checks():
     assert ev["reason"] == "console_revoked", ev
     await c.close()
     return ("activated (token + WireGuard keys), zones, radio -> console audio with talker, console talks over a "
-            "radio, inhibit / uninhibit, patch / unpatch, revoke")
+            "radio, inhibit / uninhibit, multi-talkgroup patch / add / remove / unpatch, revoke")
 
 
 def csharp_console_checks(tmp):
@@ -286,6 +304,8 @@ def csharp_console_checks(tmp):
         p.stdin.flush()
         return line(timeout)
     try:
+        mx = line()
+        assert mx["event"] == "mixer" and mx["ok"], mx
         a = line()
         assert a["g711"] and a["store_ok"] and a["blob_ok"] and a["plan"] == ["wireguard", "https"], a
         c = line()
@@ -304,6 +324,10 @@ def csharp_console_checks(tmp):
         assert edge_chan("N-FD")["voice_frames_played"] - before >= 60
         assert cmd("inhibit 3003 1")["result"] == "inhibit:3003:True:True"
         assert cmd("inhibit 3003 0")["result"] == "inhibit:3003:False:True"
+        pa = cmd("patch 100,300,400")
+        assert "patch:True:" in pa["events"] and [x["Talkgroups"] for x in pa["patches"]] == [[100, 300, 400]], pa
+        pa = cmd(f"unpatch {pa['patches'][0]['Id']}")
+        assert "patch:True:" in pa["events"] and pa["patches"] == [], pa
         p.stdin.write("quit\n")
         p.stdin.flush()
     finally:
@@ -312,7 +336,8 @@ def csharp_console_checks(tmp):
         except subprocess.TimeoutExpired:
             p.kill()
     return (f"G.711 bit-exact, DPAPI-style settings, {a['blob_bytes']}-byte WireGuardNT config, tunnel-first plan, "
-            f"heard radio 3003 ({rx['frames']['100']} frames, mixer peak {rx['peak']:.0f}), PTT, inhibit")
+            f"heard radio 3003 ({rx['frames']['100']} frames, mixer peak {rx['peak']:.0f}), PTT, inhibit, 3-way patch; "
+            f"mixer routing / per-TG side / priority ducking / VU levels ({len(mx['checks'])} checks)")
 
 
 def main():
@@ -332,10 +357,11 @@ def main():
         req("POST", "/api/talkgroups", {"id": 100, "name": "Fire", "hang_time_ms": 1500})
         req("POST", "/api/talkgroups", {"id": 200, "name": "PW", "restricted": True})
         req("POST", "/api/talkgroups", {"id": 300, "name": "Tac"})
+        req("POST", "/api/talkgroups", {"id": 400, "name": "Mutual Aid"})
         for slot, name, tg in [(1, "N-FD", 100), (2, "N-PW", 200)]:
             req("POST", "/api/channels", {"site_id": 1, "slot": slot, "name": name, "mode": "ANALOG", "talkgroup_id": tg})
         req("POST", "/api/zones", {"name": "Admin", "position": 2, "talkgroup_ids": [200]})
-        req("POST", "/api/zones", {"name": "Ops", "position": 1, "talkgroup_ids": [100, 300]})
+        req("POST", "/api/zones", {"name": "Ops", "position": 1, "talkgroup_ids": [100, 300, 400]})
         req("POST", "/api/subscribers", {"id": 1001, "alias": "E1", "talkgroup_ids": [100, 200]})
         req("POST", "/api/subscribers", {"id": 2002, "alias": "PW3"})
         req("POST", "/api/subscribers", {"id": 3003, "alias": "Portable"})

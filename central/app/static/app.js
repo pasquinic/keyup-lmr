@@ -138,7 +138,7 @@ async function editLoop(title, fields, values, save) {
 }
 
 // ------------------------------------------------------------------ generic resource page
-function resourcePage({path, listPath, title, columns, fields, idField = "id", newDefaults = {}, extraToolbar = "", rowActions}) {
+function resourcePage({path, listPath, title, columns, fields, idField = "id", newDefaults = {}, extraToolbar = "", rowActions, editValue = r => r}) {
   return async el => {
     const rows = await api("/" + (listPath || path));
     el.innerHTML = `<div class="toolbar"><input id="filter" placeholder="Filter…"><span class="spacer"></span>${extraToolbar}<button class="btn primary" id="addBtn">+ Add ${esc(title)}</button></div>
@@ -158,7 +158,7 @@ function resourcePage({path, listPath, title, columns, fields, idField = "id", n
       if (id === undefined) return;
       const row = rows.find(r => String(r[idField]) === id);
       if (e.target.dataset.edit !== undefined) {
-        if (await editLoop(`Edit ${title} ${id}`, fields, row, d => api(`/${path}/${id}`, {method: "PUT", body: d}))) route();
+        if (await editLoop(`Edit ${title} ${id}`, fields, editValue(row), d => api(`/${path}/${id}`, {method: "PUT", body: d}))) route();
       } else if (confirm(`Delete ${title} ${id}?`)) {
         try { await api(`/${path}/${id}`, {method: "DELETE"}); toast("Deleted"); route(); } catch (err) { toast(err.message, true); }
       }
@@ -560,12 +560,17 @@ pages.bandplan = resourcePage({
   newDefaults: {spacing_khz: 6.25, offset_mhz: 5, bandwidth_khz: 12.5},
 });
 
+const patchTgs = r => (r.talkgroups && r.talkgroups.length ? r.talkgroups : [r.tg_a, r.tg_b]).filter(Boolean);
+
 pages.patches = resourcePage({
   path: "patches", title: "Patch",
-  columns: [{key: "name", label: "Name"}, {label: "Talkgroup A", render: r => `TG ${esc(r.tg_a)}`}, {label: "", render: () => "⇄"},
-    {label: "Talkgroup B", render: r => `TG ${esc(r.tg_b)}`}, {label: "Enabled", render: r => yes(r.enabled)}],
-  fields: [{name: "name", label: "Name", required: true}, {name: "tg_a", label: "Talkgroup A", type: "select", options: "talkgroups", numeric: true},
-    {name: "tg_b", label: "Talkgroup B", type: "select", options: "talkgroups", numeric: true}, {name: "enabled", label: "Enabled", type: "bool", default: true}],
+  columns: [{key: "name", label: "Name"},
+    {label: "Patched talkgroups", render: r => patchTgs(r).map(t => `TG ${esc(t)}`).join(" ⇄ ")},
+    {label: "Enabled", render: r => yes(r.enabled)}],
+  fields: [{name: "name", label: "Name", required: true},
+    {name: "talkgroups", label: "Talkgroups (pick two or more; Ctrl/⌘-click)", type: "multi", options: "talkgroups", wide: true},
+    {name: "enabled", label: "Enabled", type: "bool", default: true}],
+  editValue: r => ({...r, talkgroups: patchTgs(r)}),
 });
 
 pages.network = async el => {

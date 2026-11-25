@@ -18,7 +18,8 @@ public class DialogBase : Window
         ResizeMode = ResizeMode.NoResize;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         ShowInTaskbar = false;
-        Content = Body;
+        MaxHeight = SystemParameters.WorkArea.Height - 40;
+        Content = new ScrollViewer { Content = Body, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
     }
 
     protected TextBlock Note(string text) =>
@@ -111,44 +112,152 @@ public sealed class InhibitDialog : DialogBase
     }
 }
 
+/// <summary>What the patch dialog asks the server to do.</summary>
+public sealed record PatchRequest(int[] Talkgroups, bool On, int? PatchId, string Name, string Text)
+{
+    public string Describe() => Text;
+}
+
+/// <summary>Patch any number of talkgroups together, add talkgroups to a patch, take them out, or remove a patch.</summary>
 public sealed class PatchDialog : DialogBase
 {
-    private readonly ComboBox a, b;
-    private readonly List<Talkgroup> tgs;
-    public int TgA => tgs.ElementAtOrDefault(a.SelectedIndex)?.Id ?? 0;
-    public int TgB => tgs.ElementAtOrDefault(b.SelectedIndex)?.Id ?? 0;
-    public bool Link { get; private set; }
+    private readonly List<(Talkgroup Tg, CheckBox Box)> boxes = new();
+    private readonly TextBox name;
+    public PatchRequest? Result { get; private set; }
 
-    public PatchDialog(IEnumerable<Talkgroup> talkgroups, IEnumerable<Patch> patches) : base("Patch talkgroups", 420)
+    private int[] Checked => boxes.Where(b => b.Box.IsChecked == true).Select(b => b.Tg.Id).ToArray();
+
+    public PatchDialog(IEnumerable<Talkgroup> talkgroups, IEnumerable<Patch> patches) : base("Patch talkgroups", 480)
     {
-        tgs = talkgroups.OrderBy(t => t.Id).ToList();
-        var names = tgs.Select(t => $"{t.Id} - {t.Name}").ToList();
-        Note("A patch links two talkgroups: a call on either is heard on both, across sites and modes.");
-        a = Choice("Talkgroup", names, names.FirstOrDefault() ?? "");
-        b = Choice("Patched with", names, names.Skip(1).FirstOrDefault() ?? "");
+        var tgs = talkgroups.OrderBy(t => t.Id).ToList();
+        var byId = tgs.ToDictionary(t => t.Id);
+        string TgLabel(int id) => byId.TryGetValue(id, out var t) ? $"{id} {t.Name}" : $"{id}";
+        Note("A patch links two or more talkgroups: a call on any of them is heard on all, across sites and modes. " +
+             "Tick the talkgroups, then choose what to do.");
+
+        var list = new StackPanel();
+        foreach (var t in tgs)
+        {
+            var cb = new CheckBox { Content = $"{t.Id} - {t.Name}", Foreground = Theme.Text, Margin = new Thickness(2, 3, 2, 3) };
+            boxes.Add((t, cb));
+            list.Children.Add(cb);
+        }
+        Add(new Border
+        {
+            BorderBrush = Theme.Border, BorderThickness = new Thickness(1), Background = Theme.Panel, Padding = new Thickness(6),
+            Margin = new Thickness(0, 0, 0, 10),
+            Child = new ScrollViewer { Content = list, MaxHeight = 220, VerticalScrollBarVisibility = ScrollBarVisibility.Auto },
+        });
+        name = Field("Name for a new patch (optional)");
+
+        var actions = Add(new WrapPanel { Margin = new Thickness(0, 0, 0, 10) });
+        var create = new Button { Content = "Patch ticked together", IsDefault = true };
+        create.Click += (_, _) =>
+        {
+            var sel = Checked;
+            if (sel.Length < 2) { MessageBox.Show(this, "Tick at least two talkgroups.", Title); return; }
+            Done(new PatchRequest(sel, true, null, name.Text.Trim(),
+                $"Patch {string.Join(" + ", sel)}{(name.Text.Trim().Length > 0 ? $" ({name.Text.Trim()})" : "")}"));
+        };
+        var remove = new Button { Content = "Take ticked out of patches" };
+        remove.Click += (_, _) =>
+        {
+            var sel = Checked;
+            if (sel.Length == 0) { MessageBox.Show(this, "Tick the talkgroups to take out.", Title); return; }
+            Done(new PatchRequest(sel, false, null, "", $"Unpatch TG {string.Join(", ", sel)}"));
+        };
+        actions.Children.Add(create);
+        actions.Children.Add(remove);
+
         var current = patches.ToList();
-        if (current.Count > 0)
-            Note("Current patches: " + string.Join(", ", current.Select(p => $"{p.TgA}+{p.TgB}")));
-        Buttons(("Patch", true, () => { Link = true; DialogResult = TgA != TgB; }),
-                ("Unpatch", false, () => { Link = false; DialogResult = TgA != TgB; }),
-                ("Cancel", false, () => DialogResult = false));
+        Add(new TextBlock { Text = current.Count == 0 ? "No patches." : "Current patches", FontWeight = FontWeights.Bold,
+                            Margin = new Thickness(0, 4, 0, 6) });
+        foreach (var p in current)
+        {
+            var row = new DockPanel { Margin = new Thickness(0, 0, 0, 6) };
+            var add = new Button { Content = "Add ticked", ToolTip = "Add the ticked talkgroups to this patch" };
+            add.Click += (_, _) =>
+            {
+                var sel = Checked.Where(t => !p.Talkgroups.Contains(t)).ToArray();
+                if (sel.Length == 0) { MessageBox.Show(this, "Tick talkgroups that are not in this patch yet.", Title); return; }
+                Done(new PatchRequest(sel, true, p.Id, p.Name, $"Add TG {string.Join(", ", sel)} to patch {p.Name}"));
+            };
+            var drop = new Button { Content = "Unpatch", ToolTip = "Remove this patch" };
+            drop.Click += (_, _) => Done(new PatchRequest(Array.Empty<int>(), false, p.Id, p.Name, $"Remove patch {p.Name}"));
+            DockPanel.SetDock(drop, Dock.Right);
+            DockPanel.SetDock(add, Dock.Right);
+            row.Children.Add(drop);
+            row.Children.Add(add);
+            row.Children.Add(new TextBlock
+            {
+                Text = $"{p.Name}{(p.Enabled ? "" : " (off)")}\n" + string.Join(" + ", p.Talkgroups.Select(TgLabel)),
+                TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center,
+            });
+            Add(row);
+        }
+        Buttons(("Close", false, () => DialogResult = false));
     }
+
+    private void Done(PatchRequest r) { Result = r; DialogResult = true; }
 }
 
 public sealed class SettingsDialog : DialogBase
 {
-    private readonly ComboBox output, input, transport;
+    private static readonly string[] SideNames = { "Both ears", "Left ear", "Right ear" };
+    private static readonly (string Name, double Db)[] Ducks =
+        { ("No change", 0), ("6 dB quieter", 6), ("12 dB quieter", 12), ("18 dB quieter", 18), ("24 dB quieter", 24), ("Muted", 60) };
+    private readonly ComboBox output, unselectOutput, selectSide, unselectSide, input, transport, duck;
+    private readonly CheckBox txTones, rxTones;
+    private readonly Slider toneVolume;
     private readonly TextBox pttKey;
     public string OutputDevice => (string?)output.SelectedItem == "Default" ? "" : (string?)output.SelectedItem ?? "";
+    public string UnselectDevice => unselectOutput.SelectedIndex <= 0 ? "" : (string?)unselectOutput.SelectedItem ?? "";
+    public Side SelectSide => ToSide(selectSide.SelectedIndex);
+    public Side UnselectSide => ToSide(unselectSide.SelectedIndex);
     public string InputDevice => (string?)input.SelectedItem == "Default" ? "" : (string?)input.SelectedItem ?? "";
     public string PttKey => pttKey.Text.Trim();
     public TransportPreference Transport => Enum.TryParse<TransportPreference>((string?)transport.SelectedItem, out var t) ? t : TransportPreference.Auto;
+    public bool TxTones => txTones.IsChecked == true;
+    public bool RxTones => rxTones.IsChecked == true;
+    public double ToneVolume => toneVolume.Value;
+    public double PriorityDuckDb => Ducks[Math.Max(0, duck.SelectedIndex)].Db;
 
-    public SettingsDialog(ConsoleSettings s, bool serviceInstalled) : base("Settings", 460)
+    private static Side ToSide(int i) => i switch { 1 => Side.Left, 2 => Side.Right, _ => Side.Both };
+    private static string SideName(Side s) => s switch { Side.Left => SideNames[1], Side.Right => SideNames[2], _ => SideNames[0] };
+
+    private TextBlock Heading(string text) =>
+        Add(new TextBlock { Text = text, FontWeight = FontWeights.Bold, FontSize = 14, Margin = new Thickness(0, 6, 0, 8) });
+
+    public SettingsDialog(ConsoleSettings s, bool serviceInstalled) : base("Settings", 500)
     {
-        output = Choice("Speaker", new[] { "Default" }.Concat(WinMm.OutputDevices()), s.OutputDevice.Length > 0 ? s.OutputDevice : "Default");
+        var outs = WinMm.OutputDevices();
+        Heading("Audio routing");
+        Note("Selected audio is the talkgroup you talk on, plus tones. Unselected audio is every other monitored talkgroup. " +
+             "Give unselected audio its own device (e.g. a desk speaker) or send each to one ear of a headset. " +
+             "Each talkgroup tile can also pick its own ear (L / R / L+R).");
+        output = Choice("Selected audio: device (headset)", new[] { "Default" }.Concat(outs), s.OutputDevice.Length > 0 ? s.OutputDevice : "Default");
+        selectSide = Choice("Selected audio: ear", SideNames, SideName(s.SelectSide));
+        unselectOutput = Choice("Unselected audio: device", new[] { "Same as selected audio" }.Concat(outs),
+                                s.UnselectDevice.Length > 0 ? s.UnselectDevice : "Same as selected audio");
+        unselectSide = Choice("Unselected audio: ear", SideNames, SideName(s.UnselectSide));
+
+        Heading("Tones");
+        txTones = Add(new CheckBox { Content = "TX tones: talk-permit and busy / deny", IsChecked = s.TxTones, Foreground = Theme.Text,
+                                     Margin = new Thickness(0, 0, 0, 6) });
+        rxTones = Add(new CheckBox { Content = "RX tones: emergency alert (the red banner still shows)", IsChecked = s.RxTones,
+                                     Foreground = Theme.Text, Margin = new Thickness(0, 0, 0, 8) });
+        Add(new TextBlock { Text = "Tone volume", Margin = new Thickness(0, 0, 0, 4) });
+        toneVolume = Add(new Slider { Minimum = 0, Maximum = 1.5, Value = s.ToneVolume, IsMoveToPointEnabled = true, Margin = new Thickness(0, 0, 0, 10) });
+
+        Heading("Priority talkgroups");
+        Note("Mark a talkgroup as priority with the ☆ on its tile. While it is active, other talkgroups are:");
+        duck = Choice("", Ducks.Select(d => d.Name), Ducks.OrderBy(d => Math.Abs(d.Db - s.PriorityDuckDb)).First().Name);
+
+        Heading("Microphone and PTT");
         input = Choice("Microphone", new[] { "Default" }.Concat(WinMm.InputDevices()), s.InputDevice.Length > 0 ? s.InputDevice : "Default");
         pttKey = Field("Push-to-talk key (e.g. Space, F12, RightCtrl, Pause)", s.PttKey);
+
+        Heading("Connection");
         transport = Choice("Connection", Enum.GetNames<TransportPreference>(), s.Transport.ToString());
         Note("Auto: through the built-in WireGuard tunnel when it is up, otherwise over HTTPS. " +
              (serviceInstalled ? "The KeyUp Tunnel service is installed." :

@@ -6,7 +6,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import { router, useLocalSearchParams } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View,
+  ActivityIndicator, Image, KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View,
 } from 'react-native';
 
 import { parseActivationUri } from '../protocol';
@@ -96,6 +96,7 @@ export default function Activate() {
   return (
     <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <ScrollView contentContainerStyle={s.wrap} keyboardShouldPersistTaps="handled">
+        <Image source={require('../../assets/logo.png')} style={s.logo} accessibilityLabel="KeyUp" />
         <Text style={s.brand}>
           KEY<Text style={{ color: C.accent }}>UP</Text>
         </Text>
@@ -126,6 +127,7 @@ export default function Activate() {
 
 const s = StyleSheet.create({
   wrap: { padding: 24, gap: 6 },
+  logo: { width: 88, height: 88, marginBottom: 12 },
   brand: { color: C.text, fontSize: 32, fontWeight: '700', letterSpacing: 6, marginBottom: 8 },
   muted: { color: C.muted, fontSize: 14, lineHeight: 20 },
   label: { color: C.muted, fontSize: 12, marginTop: 10, textTransform: 'uppercase', letterSpacing: 1 },

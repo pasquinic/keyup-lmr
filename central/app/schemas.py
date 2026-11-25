@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 Mode = Literal["P25P1", "P25P2", "DMR", "NXDN", "ANALOG"]
 
@@ -159,10 +159,23 @@ class BandPlanIn(BaseModel):
 
 
 class PatchIn(BaseModel):
+    """A patch of two or more talkgroups. Send `talkgroups`; `tg_a` / `tg_b` alone still work."""
     name: str
-    tg_a: int
-    tg_b: int
+    talkgroups: list[int] = []
+    tg_a: int = 0
+    tg_b: int = 0
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def _members(self):
+        tgs: list[int] = []
+        for tg in (self.talkgroups or [self.tg_a, self.tg_b]):
+            if tg and int(tg) not in tgs:
+                tgs.append(int(tg))
+        if len(tgs) < 2:
+            raise ValueError("a patch needs at least two different talkgroups")
+        self.talkgroups, self.tg_a, self.tg_b = tgs, tgs[0], tgs[1]
+        return self
 
 
 class PocActivateIn(BaseModel):

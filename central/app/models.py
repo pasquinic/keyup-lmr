@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 
-from sqlalchemy import (Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Table, Text,
+from sqlalchemy import (JSON, Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Table, Text,
                         UniqueConstraint)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -297,13 +297,16 @@ class BandPlanEntry(DictMixin, Base):
 
 
 class TalkgroupPatch(DictMixin, Base):
-    """Links two talkgroups: a call on either is heard on both (across modes; the router transcodes)."""
+    """Links two or more talkgroups: a call on any of them is heard on all (across modes; the router
+    transcodes). `talkgroups` holds every member; tg_a / tg_b mirror the first two for older readers."""
     __tablename__ = "talkgroup_patches"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(64))
-    tg_a: Mapped[int] = mapped_column(ForeignKey("talkgroups.id", ondelete="CASCADE"))
-    tg_b: Mapped[int] = mapped_column(ForeignKey("talkgroups.id", ondelete="CASCADE"))
+    tg_a: Mapped[int] = mapped_column(Integer, default=0)
+    tg_b: Mapped[int] = mapped_column(Integer, default=0)
+    talkgroups: Mapped[list] = mapped_column(JSON, default=list)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
 
 
 class SipRoute(DictMixin, Base):

@@ -16,6 +16,56 @@ short[] samples = { 0, 1, -1, 100, -100, 1000, -1000, 8000, -8000, 32767, -32768
 byte[] expect = { 255, 255, 127, 242, 114, 206, 78, 160, 32, 128, 0, 151, 23 };
 bool g711 = G711.Encode(samples).SequenceEqual(expect) && G711.Decode(G711.Encode(new short[] { 12345 }))[0] is > 11800 and < 12900;
 
+// Mixer routing, side overrides, priority ducking and meters (no server needed)
+static byte[] Tone(double hz, int frames, double amp = 9000)
+{
+    var pcm = new short[160 * frames];
+    for (int k = 0; k < pcm.Length; k++) pcm[k] = (short)(amp * Math.Sin(2 * Math.PI * hz * k / 8000.0));
+    return G711.Encode(pcm);
+}
+static (double L, double R) Peaks(short[] st)
+{
+    int l = 0, r = 0;
+    for (int i = 0; i < st.Length; i += 2) { l = Math.Max(l, Math.Abs((int)st[i])); r = Math.Max(r, Math.Abs((int)st[i + 1])); }
+    return (l / 32768.0, r / 32768.0);
+}
+var mix = new Dictionary<string, bool>();
+{
+    var m = new Mixer { SelectedTg = 100, SelectRoute = new AudioRoute(0, Side.Left), UnselectRoute = new AudioRoute(1, Side.Right), DuckDb = 12 };
+    m.Add(1, 100, Tone(500, 20));
+    m.Add(2, 300, Tone(800, 20));
+    short[][] f = m.PullStereo();
+    for (int i = 0; i < 4; i++) f = m.PullStereo();          // past the jitter-buffer prime
+    var (s0, s1) = (Peaks(f[0]), Peaks(f[1]));
+    mix["select_left_on_output0"] = s0.L > 0.1 && s0.R == 0;
+    mix["unselect_right_on_output1"] = s1.R > 0.1 && s1.L == 0;
+    m.SetSide(300, Side.Left);
+    f = m.PullStereo();
+    mix["per_talkgroup_side"] = Peaks(f[1]).L > 0.1 && Peaks(f[1]).R == 0;
+    double plain = Peaks(f[0]).L;
+    m.SetPriority(300, true);
+    f = m.PullStereo();
+    double ducked = Peaks(f[0]).L;
+    mix["priority_ducks_others"] = m.PriorityActive && Math.Abs(20 * Math.Log10(ducked / plain) + 12) < 1.5
+                                   && Peaks(f[1]).L > 0.1;
+    mix["talkgroup_meter"] = m.TakeTalkgroupLevel(100) > 0.2 && m.TakeTalkgroupLevel(100) == 0;
+    mix["output_meter"] = m.TakeOutputLevel(1) > 0.1 && m.TakeOutputLevel(1) == 0;
+    m.SetPriority(300, false);
+    m.ToneVolume = 0;
+    m.Add(-1, 0, Tone(1200, 3));
+    f = m.PullStereo();
+    mix["tone_volume_zero_is_silent"] = Math.Abs(Peaks(f[0]).L - plain) < 0.02;
+    m.MasterVolume = 0.5;
+    f = m.PullStereo();
+    mix["master_volume"] = Math.Abs(Peaks(f[0]).L - plain / 2) < 0.02;
+    var st0 = new ConsoleSettings { OutputDevice = "Headset", UnselectDevice = "Speakers", SelectSide = Side.Right };
+    var m2 = new Mixer();
+    st0.ApplyTo(m2);
+    mix["settings_routes"] = m2.UnselectRoute.Output == 1 && m2.SelectRoute == new AudioRoute(0, Side.Right)
+                             && new ConsoleSettings { OutputDevice = "A", UnselectDevice = "A" }.SeparateUnselectDevice == false;
+}
+Emit(new { @event = "mixer", checks = mix, ok = mix.Values.All(x => x) });
+
 var act = await Activation.ActivateAsync(args[0], args[1], "headless-check");
 var settingsPath = Path.Combine(Path.GetTempPath(), $"keyup-console-{Environment.ProcessId}.json");
 var st = new ConsoleSettings();
@@ -45,6 +95,8 @@ client.Granted += tg => { lock (events) events.Add($"grant:{tg}"); };
 client.Denied += (tg, r) => { lock (events) events.Add($"deny:{tg}:{r}"); };
 client.InhibitResult += (u, on, ok, r) => { lock (events) events.Add($"inhibit:{u}:{on}:{ok}"); };
 client.AuthFailed += r => { lock (events) events.Add($"auth_fail:{r}"); };
+client.PatchResult += (ok, r) => { lock (events) events.Add($"patch:{ok}:{r}"); };
+client.ProfileChanged += pr => { lock (events) events.Add("profile:" + string.Join(";", pr.Patches.Select(x => $"{x.Id}={string.Join(",", x.Talkgroups)}"))); };
 
 var publicUrl = plan.First(p => p.Transport == "https").Url;
 var refused = await client.ConnectAsync(publicUrl, reloaded.Token, "https", "headless", TimeSpan.FromSeconds(10));
@@ -112,6 +164,18 @@ while ((line = Console.In.ReadLine()) != null)
                 for (int w = 0; w < 40 && events.Count == 0; w++) await Task.Delay(50);
                 lock (events) Emit(new { @event = "inhibit", result = events.FirstOrDefault() ?? "timeout" });
                 break;
+            case "patch":       // patch <tg,tg,...> [id]   |   unpatch <id>
+            case "unpatch":
+            {
+                lock (events) events.Clear();
+                if (cmd[0] == "patch")
+                    await client.PatchAsync(cmd[1].Split(',').Select(int.Parse), true, cmd.Length > 2 ? int.Parse(cmd[2]) : null, "headless");
+                else
+                    await client.PatchAsync(Array.Empty<int>(), false, int.Parse(cmd[1]));
+                for (int w = 0; w < 60 && !events.Any(e => e.StartsWith("profile:")); w++) await Task.Delay(50);
+                lock (events) Emit(new { @event = "patch", events, patches = client.Profile?.Patches.Select(x => new { x.Id, x.Talkgroups }) });
+                break;
+            }
             case "events":
                 lock (events) Emit(new { @event = "events", events });
                 break;

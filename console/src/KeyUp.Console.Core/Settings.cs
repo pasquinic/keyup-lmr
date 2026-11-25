@@ -28,6 +28,40 @@ public sealed class ConsoleSettings
     public int SelectedTalkgroup { get; set; }
     public int SelectedZone { get; set; }
 
+    // ---- audio: routing (OutputDevice is the select / main device), levels, tones, priority
+    public string UnselectDevice { get; set; } = "";          // "" = same device as selected audio
+    public Side SelectSide { get; set; } = Side.Both;
+    public Side UnselectSide { get; set; } = Side.Both;
+    public Dictionary<int, Side> Sides { get; set; } = new();  // per-talkgroup override
+    public double MasterVolume { get; set; } = 1.0;
+    public double SelectVolume { get; set; } = 1.0;
+    public double UnselectVolume { get; set; } = 0.7;
+    public double ToneVolume { get; set; } = 0.8;
+    public double MicGain { get; set; } = 1.0;
+    public bool TxTones { get; set; } = true;                  // talk permit + busy / deny
+    public bool RxTones { get; set; } = true;                  // emergency alert
+    public List<int> PriorityTalkgroups { get; set; } = new();
+    public double PriorityDuckDb { get; set; } = 12;
+
+    /// <summary>Apply the audio settings to a mixer. Selected audio is output 0; unselected audio is output 1
+    /// only when it has a device of its own.</summary>
+    public void ApplyTo(Mixer m)
+    {
+        m.MasterVolume = MasterVolume;
+        m.SelectVolume = SelectVolume;
+        m.UnselectVolume = UnselectVolume;
+        m.ToneVolume = ToneVolume;
+        m.DuckDb = PriorityDuckDb;
+        m.SelectRoute = new AudioRoute(0, SelectSide == Side.Auto ? Side.Both : SelectSide);
+        m.UnselectRoute = new AudioRoute(SeparateUnselectDevice ? 1 : 0, UnselectSide == Side.Auto ? Side.Both : UnselectSide);
+        foreach (var (tg, v) in Volumes) m.SetVolume(tg, v);
+        foreach (var (tg, s) in Sides) m.SetSide(tg, s);
+        foreach (var tg in PriorityTalkgroups) m.SetPriority(tg, true);
+        m.SelectedTg = SelectedTalkgroup;
+    }
+
+    [JsonIgnore] public bool SeparateUnselectDevice => UnselectDevice.Length > 0 && UnselectDevice != OutputDevice;
+
     public static string Folder => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "KeyUp Dispatch Console");
     public static string FilePath => Path.Combine(Folder, "console.json");
 

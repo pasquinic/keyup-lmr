@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512"><defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#18222e"/><stop offset="1" stop-color="#0b1016"/></linearGradient>
+    <linearGradient id="key" gradientUnits="userSpaceOnUse" x1="0" y1="196" x2="0" y2="430"><stop offset="0" stop-color="#5cc8ff"/><stop offset="1" stop-color="#2a7fff"/></linearGradient>
+    <linearGradient id="wave" gradientUnits="userSpaceOnUse" x1="0" y1="50" x2="0" y2="200"><stop offset="0" stop-color="#2fd18b"/><stop offset="1" stop-color="#3fb6ff"/></linearGradient>
+  </defs><g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <g stroke="url(#wave)" stroke-width="22" opacity="0.95"><path d="M199.4,133.5 A92,92 0 0 0 164.9,193.2"/><path d="M312.6,133.5 A92,92 0 0 1 347.1,193.2"/><path d="M166.1,91.0 A146,146 0 0 0 111.4,185.7"/><path d="M345.9,91.0 A146,146 0 0 1 400.6,185.7"/></g>
+    <path d="M168,300 L256,212 L344,300" stroke="url(#key)" stroke-width="54"/>
+    <path d="M256,236 L256,404" stroke="url(#key)" stroke-width="54"/>
+  </g>
+  <circle cx="256" cy="206" r="17" fill="#ffffff"/></svg>

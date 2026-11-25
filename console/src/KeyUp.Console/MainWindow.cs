@@ -15,7 +15,9 @@ public sealed class MainWindow : Window
     private readonly ConsoleSettings settings = ConsoleSettings.Load();
     private readonly Mixer mixer = new();
     private ConsoleClient? client;
-    private SpeakerOutput? speaker;
+    private readonly AudioEngine audio;
+    private double micPeak;                          // since the last meter update (mic thread -> UI)
+    private readonly object micGate = new();
     private MicrophoneInput? mic;
     private Profile? profile;
     private readonly Dictionary<int, List<ChannelTile>> tiles = new();
@@ -40,18 +42,29 @@ public sealed class MainWindow : Window
     private readonly Button pttButton = new() { Height = 64, FontSize = 20, FontWeight = FontWeights.Bold, Margin = new Thickness(8) };
     private readonly TextBlock status = new() { Foreground = Theme.Muted, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 0, 12, 0) };
     private readonly Button btnInhibit = new() { Content = "Inhibit…" }, btnPatch = new() { Content = "Patch…" };
+    private readonly VuMeter rxMeter = new() { Height = 10, Width = 200, VerticalAlignment = VerticalAlignment.Center };
+    private readonly VuMeter txMeter = new() { Height = 10, Width = 200, VerticalAlignment = VerticalAlignment.Center };
+    private readonly TextBlock priorityNote = new() { Foreground = ChannelTile.PriorityBrush, FontWeight = FontWeights.SemiBold,
+                                                      VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 0, 0, 0) };
     private readonly Dictionary<int, (int Src, string Alias)> emergencies = new();
 
     public MainWindow()
     {
         Title = "KeyUp Dispatch Console";
+        Icon = AppIcon.WindowIcon();
         Width = 1280;
         Height = 820;
         MinWidth = 900;
         MinHeight = 560;
         selectedTg = settings.SelectedTalkgroup;
+        audio = new AudioEngine(mixer);
+        settings.ApplyTo(mixer);
         Content = BuildLayout();
-        foreach (var (tg, v) in settings.Volumes) mixer.SetVolume(tg, v);
+
+        // meters: ~20 updates a second
+        var meters = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+        meters.Tick += (_, _) => UpdateMeters();
+        meters.Start();
 
         var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         timer.Tick += (_, _) => { clock.Text = DateTime.Now.ToString("HH:mm:ss"); foreach (var l in tiles.Values) foreach (var t in l) t.Tick(); };
@@ -87,6 +100,8 @@ public sealed class MainWindow : Window
         names.Children.Add(title);
         names.Children.Add(subtitle);
         var left = new StackPanel { Orientation = Orientation.Horizontal };
+        var logo = AppIcon.Logo(40);
+        if (logo != null) { logo.Margin = new Thickness(0, 0, 12, 0); left.Children.Add(logo); }
         left.Children.Add(names);
         left.Children.Add(link);
         hp.Children.Add(left);
@@ -107,9 +122,10 @@ public sealed class MainWindow : Window
         var footer = new DockPanel { Background = Theme.Panel };
         pttButton.PreviewMouseLeftButtonDown += async (_, e) => { e.Handled = true; pttButton.CaptureMouse(); await StartTxAsync(selectedTg); };
         pttButton.PreviewMouseLeftButtonUp += async (_, e) => { e.Handled = true; pttButton.ReleaseMouseCapture(); await StopTxAsync(); };
-        pttButton.Width = 420;
+        pttButton.Width = 380;
         DockPanel.SetDock(pttButton, Dock.Left);
         footer.Children.Add(pttButton);
+        footer.Children.Add(BuildAudioBar());
         footer.Children.Add(status);
         DockPanel.SetDock(footer, Dock.Bottom);
         root.Children.Add(footer);
@@ -131,15 +147,74 @@ public sealed class MainWindow : Window
         return root;
     }
 
+    /// <summary>Bottom bar: RX (mixed speaker audio) and TX (microphone) meters, and the console's main levels.</summary>
+    private UIElement BuildAudioBar()
+    {
+        var bar = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(8, 6, 8, 6) };
+        DockPanel.SetDock(bar, Dock.Left);
+
+        var meters = new Grid { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 16, 0) };
+        meters.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        meters.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        meters.RowDefinitions.Add(new RowDefinition());
+        meters.RowDefinitions.Add(new RowDefinition());
+        void Row(int r, string label, VuMeter m, string tip)
+        {
+            var t = new TextBlock { Text = label, FontWeight = FontWeights.Bold, Width = 28, Foreground = Theme.Muted, Margin = new Thickness(0, 3, 6, 3) };
+            Grid.SetRow(t, r); meters.Children.Add(t);
+            m.ToolTip = tip;
+            Grid.SetRow(m, r); Grid.SetColumn(m, 1); meters.Children.Add(m);
+        }
+        Row(0, "RX", rxMeter, "Receive: the mixed audio going to your speakers / headset");
+        Row(1, "TX", txMeter, "Transmit: your microphone (after mic gain)");
+        bar.Children.Add(meters);
+
+        void Level(string label, double value, double max, string tip, Action<double> set)
+        {
+            var p = new StackPanel { Margin = new Thickness(6, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center };
+            var t = new TextBlock { FontSize = 11, Foreground = Theme.Muted };
+            var s = new Slider { Minimum = 0, Maximum = max, Value = value, Width = 96, IsMoveToPointEnabled = true, ToolTip = tip };
+            void Show() => t.Text = $"{label} {s.Value * 100:0}%";
+            s.ValueChanged += (_, e) => { set(e.NewValue); Show(); };
+            Show();
+            p.Children.Add(t);
+            p.Children.Add(s);
+            bar.Children.Add(p);
+        }
+        Level("Master", settings.MasterVolume, 1.5, "Overall speaker volume", v => { settings.MasterVolume = v; mixer.MasterVolume = v; });
+        Level("Select", settings.SelectVolume, 1.5, "Volume of the selected talkgroup",
+                             v => { settings.SelectVolume = v; mixer.SelectVolume = v; });
+        Level("Unselect", settings.UnselectVolume, 1.5, "Volume of the other monitored talkgroups",
+                               v => { settings.UnselectVolume = v; mixer.UnselectVolume = v; });
+        Level("Mic", settings.MicGain, 3, "Microphone gain", v => settings.MicGain = v);
+        bar.Children.Add(priorityNote);
+        return bar;
+    }
+
+    private void UpdateMeters()
+    {
+        foreach (var (tg, list) in tiles)
+        {
+            var lvl = mixer.TakeTalkgroupLevel(tg);
+            foreach (var t in list) t.PushLevel(lvl);
+        }
+        rxMeter.Push(Math.Max(mixer.TakeOutputLevel(0), mixer.TakeOutputLevel(1)));
+        double mp;
+        lock (micGate) { mp = micPeak; micPeak = 0; }
+        txMeter.Push(txTg != null ? mp : 0);
+        priorityNote.Text = mixer.PriorityActive ? "★ priority talkgroup active" : "";
+    }
+
+    private void StartAudio()
+    {
+        var err = audio.Start(settings.OutputDevice, settings.UnselectDevice, settings.SeparateUnselectDevice);
+        if (err != null) Log(err);
+    }
+
     // ================================================================== connection
     private async Task StartAsync()
     {
-        try
-        {
-            speaker = new SpeakerOutput(mixer.Pull);
-            speaker.Start(WinMm.DeviceIndex(WinMm.OutputDevices(), settings.OutputDevice));
-        }
-        catch (Exception e) { Log($"Speaker: {e.Message}"); }
+        StartAudio();
         if (!settings.IsActivated)
         {
             SetLink("not activated", Theme.Warn);
@@ -281,6 +356,7 @@ public sealed class MainWindow : Window
         btnPatch.IsEnabled = p.Rights.Patch;
         if (settings.Monitored.Count == 0) settings.Monitored = p.Talkgroups.Keys.ToList();
         if (!p.Talkgroups.ContainsKey(selectedTg)) selectedTg = p.Zones.SelectMany(z => z.Talkgroups).FirstOrDefault();
+        mixer.SelectedTg = selectedTg;
         int keepTab = zoneTabs.SelectedIndex;
         zoneTabs.Items.Clear();
         tiles.Clear();
@@ -290,12 +366,15 @@ public sealed class MainWindow : Window
             foreach (var id in z.Talkgroups)
             {
                 if (!p.Talkgroups.TryGetValue(id, out var tg)) continue;
-                var tile = new ChannelTile(tg, settings.Monitored.Contains(id), mixer.VolumeOf(id)) { Selected = id == selectedTg };
+                var tile = new ChannelTile(tg, settings.Monitored.Contains(id), mixer.VolumeOf(id),
+                                           settings.PriorityTalkgroups.Contains(id), mixer.SideOf(id)) { Selected = id == selectedTg };
                 tile.MonitorChanged += async (t, on) => await SetMonitoredAsync(t.Tg, on);
                 tile.SelectRequested += t => Select(t.Tg);
                 tile.PttPressed += async t => await StartTxAsync(t.Tg);
                 tile.PttReleased += async _ => await StopTxAsync();
                 tile.VolumeChanged += (t, v) => { mixer.SetVolume(t.Tg, v); settings.Volumes[t.Tg] = v; };
+                tile.PriorityChanged += (t, on) => SetPriority(t.Tg, on);
+                tile.SideChanged += (t, s) => SetSide(t.Tg, s);
                 if (!tiles.TryGetValue(id, out var list)) tiles[id] = list = new();
                 list.Add(tile);
                 wrap.Children.Add(tile);
@@ -306,11 +385,28 @@ public sealed class MainWindow : Window
         }
         zoneTabs.SelectedIndex = keepTab >= 0 && keepTab < zoneTabs.Items.Count ? keepTab : 0;
         patchList.Text = p.Patches.Count == 0 ? "none" : string.Join("\n", p.Patches.Select(x =>
-            $"{x.TgA} {p.Talkgroups.GetValueOrDefault(x.TgA)?.Name} + {x.TgB} {p.Talkgroups.GetValueOrDefault(x.TgB)?.Name}"));
+            $"{x.Name}: " + string.Join(" + ", x.Talkgroups.Select(t => $"{t} {p.Talkgroups.GetValueOrDefault(t)?.Name}".Trim()))));
         foreach (var (tg, e) in p.Emergencies) emergencies[tg] = e;
         foreach (var (id, c) in calls) SetTiles(c.Info.Tg, TileState.Receiving, $"{c.Info.Alias} ({c.Info.Src})");
         UpdateEmergencies();
         UpdatePttButton();
+        settings.Save();
+    }
+
+    private void SetPriority(int tg, bool on)
+    {
+        settings.PriorityTalkgroups.Remove(tg);
+        if (on) settings.PriorityTalkgroups.Add(tg);
+        mixer.SetPriority(tg, on);
+        foreach (var t in tiles.GetValueOrDefault(tg) ?? new()) t.Priority = on;
+        settings.Save();
+    }
+
+    private void SetSide(int tg, Side s)
+    {
+        if (s == Side.Auto) settings.Sides.Remove(tg); else settings.Sides[tg] = s;
+        mixer.SetSide(tg, s);
+        foreach (var t in tiles.GetValueOrDefault(tg) ?? new()) if (t.Side != s) t.Side = s;
         settings.Save();
     }
 
@@ -335,6 +431,7 @@ public sealed class MainWindow : Window
     {
         selectedTg = tg;
         settings.SelectedTalkgroup = tg;
+        mixer.SelectedTg = tg;
         foreach (var (id, list) in tiles) foreach (var t in list) t.Selected = id == tg;
         UpdatePttButton();
         settings.Save();
@@ -390,10 +487,17 @@ public sealed class MainWindow : Window
         txPending = null;
         txTg = tg;
         SetTiles(tg, TileState.Transmitting);
-        mixer.Add(-1, 0, Tones.Grant);
+        if (settings.TxTones) mixer.Add(-1, 0, Tones.Grant);
         try
         {
-            mic = new MicrophoneInput(frame => { var c = client; if (c != null && txTg != null) _ = c.SendAudioAsync(G711.Encode(frame)); });
+            mic = new MicrophoneInput(frame =>
+            {
+                var pcm = Levels.Gain(frame, settings.MicGain);
+                var lvl = Levels.Peak(pcm);
+                lock (micGate) micPeak = Math.Max(micPeak, lvl);
+                var c = client;
+                if (c != null && txTg != null) _ = c.SendAudioAsync(G711.Encode(pcm));
+            });
             mic.Start(WinMm.DeviceIndex(WinMm.InputDevices(), settings.InputDevice));
         }
         catch (Exception e) { Log($"Microphone: {e.Message}"); }
@@ -405,7 +509,7 @@ public sealed class MainWindow : Window
     {
         txPending = null;
         SetTiles(tg, calls.Values.Any(x => x.Info.Tg == tg) ? TileState.Receiving : TileState.Idle);
-        mixer.Add(-2, 0, Tones.Deny);
+        if (settings.TxTones) mixer.Add(-2, 0, Tones.Deny);
         status.Text = $"TG {tg}: {Describe(reason)}";
         UpdatePttButton();
     }
@@ -465,7 +569,7 @@ public sealed class MainWindow : Window
     // ================================================================== emergencies / rights
     private void OnEmergency(int tg, int src, string alias, bool on)
     {
-        if (on) { emergencies[tg] = (src, alias); mixer.Add(-3, 0, Tones.Emergency); Log($"⚠ EMERGENCY TG {tg} by {alias} ({src})"); }
+        if (on) { emergencies[tg] = (src, alias); if (settings.RxTones) mixer.Add(-3, 0, Tones.Emergency); Log($"⚠ EMERGENCY TG {tg} by {alias} ({src})"); }
         else { emergencies.Remove(tg); Log($"Emergency on TG {tg} cleared"); }
         UpdateEmergencies();
     }
@@ -498,9 +602,9 @@ public sealed class MainWindow : Window
     {
         if (client == null || profile?.Rights.Patch != true) return;
         var d = new PatchDialog(profile.Talkgroups.Values, profile.Patches) { Owner = this };
-        if (d.ShowDialog() != true) return;
-        await client.PatchAsync(d.TgA, d.TgB, d.Link);
-        Log($"{(d.Link ? "Patch" : "Unpatch")} TG {d.TgA} + {d.TgB}");
+        if (d.ShowDialog() != true || d.Result is not { } r) return;
+        await client.PatchAsync(r.Talkgroups, r.On, r.PatchId, r.Name);
+        Log(r.Describe());
     }
 
     // ================================================================== activation / settings
@@ -539,19 +643,22 @@ public sealed class MainWindow : Window
     {
         var d = new SettingsDialog(settings, TunnelService.IsInstalled()) { Owner = this };
         if (d.ShowDialog() != true) return;
-        bool audioChanged = d.OutputDevice != settings.OutputDevice;
+        bool audioChanged = d.OutputDevice != settings.OutputDevice || d.UnselectDevice != settings.UnselectDevice;
         bool transportChanged = d.Transport != settings.Transport;
         settings.OutputDevice = d.OutputDevice;
+        settings.UnselectDevice = d.UnselectDevice;
+        settings.SelectSide = d.SelectSide;
+        settings.UnselectSide = d.UnselectSide;
+        settings.TxTones = d.TxTones;
+        settings.RxTones = d.RxTones;
+        settings.ToneVolume = d.ToneVolume;
+        settings.PriorityDuckDb = d.PriorityDuckDb;
         settings.InputDevice = d.InputDevice;
         settings.PttKey = d.PttKey.Length > 0 ? d.PttKey : "Space";
         settings.Transport = d.Transport;
         settings.Save();
-        if (audioChanged)
-        {
-            speaker?.Dispose();
-            speaker = new SpeakerOutput(mixer.Pull);
-            try { speaker.Start(WinMm.DeviceIndex(WinMm.OutputDevices(), settings.OutputDevice)); } catch (Exception e) { Log($"Speaker: {e.Message}"); }
-        }
+        settings.ApplyTo(mixer);
+        if (audioChanged) StartAudio();
         if (transportChanged && client != null)
         {
             if (settings.Transport == TransportPreference.Https && TunnelService.IsInstalled()) ConnectionPlan.RequestTunnel(settings, false);
@@ -578,7 +685,7 @@ public sealed class MainWindow : Window
         reconnect?.Cancel();
         settings.Save();
         mic?.Dispose();
-        speaker?.Dispose();
+        audio.Dispose();
         if (client != null) _ = client.DisposeAsync();
         localTunnel?.Dispose();
     }

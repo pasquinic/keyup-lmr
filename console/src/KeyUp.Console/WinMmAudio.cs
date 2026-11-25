@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 using System.Runtime.InteropServices;
+using KeyUp.Console.Core;
 
 namespace KeyUp.Console;
 
-/// <summary>8 kHz / 16-bit mono speaker output and microphone input through WinMM (waveOut / waveIn).
+/// <summary>8 kHz / 16-bit speaker output (stereo, so audio can be routed left / right) and mono microphone
+/// input through WinMM (waveOut / waveIn).
 /// A worker thread polls the buffers' DONE flags every few milliseconds; 20 ms per buffer.</summary>
 public static class WinMm
 {
@@ -18,6 +20,8 @@ public static class WinMm
         public ushort nBlockAlign, wBitsPerSample, cbSize;
         public static WaveFormat Pcm8k => new() { wFormatTag = 1, nChannels = 1, nSamplesPerSec = 8000, nAvgBytesPerSec = 16000,
                                                   nBlockAlign = 2, wBitsPerSample = 16, cbSize = 0 };
+        public static WaveFormat Stereo8k => new() { wFormatTag = 1, nChannels = 2, nSamplesPerSec = 8000, nAvgBytesPerSec = 32000,
+                                                     nBlockAlign = 4, wBitsPerSample = 16, cbSize = 0 };
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -102,10 +106,11 @@ internal sealed class WaveBuffers : IDisposable
     public static readonly int HeaderSize = Marshal.SizeOf<WinMm.WaveHdr>();
     private static readonly int FlagsOffset = (int)Marshal.OffsetOf<WinMm.WaveHdr>(nameof(WinMm.WaveHdr.dwFlags));
     private static readonly int RecordedOffset = (int)Marshal.OffsetOf<WinMm.WaveHdr>(nameof(WinMm.WaveHdr.dwBytesRecorded));
-    public const int Bytes = 320;
+    public readonly int Bytes;
 
-    public WaveBuffers(int count)
+    public WaveBuffers(int count, int bytes = 320)
     {
+        Bytes = bytes;
         Headers = new IntPtr[count];
         data = new IntPtr[count];
         for (int i = 0; i < count; i++)
@@ -143,10 +148,11 @@ internal sealed class WaveBuffers : IDisposable
     }
 }
 
+/// <summary>Stereo 8 kHz output. <c>pull</c> returns 20 ms as 320 interleaved samples (L, R).</summary>
 public sealed class SpeakerOutput : IDisposable
 {
     private IntPtr hwo;
-    private readonly WaveBuffers bufs = new(6);
+    private readonly WaveBuffers bufs = new(6, 640);
     private readonly Func<short[]> pull;
     private Thread? thread;
     private volatile bool running;
@@ -155,13 +161,13 @@ public sealed class SpeakerOutput : IDisposable
 
     public void Start(int device)
     {
-        var fmt = WinMm.WaveFormat.Pcm8k;
+        var fmt = WinMm.WaveFormat.Stereo8k;
         int r = WinMm.waveOutOpen(out hwo, device, ref fmt, IntPtr.Zero, IntPtr.Zero, 0);
         if (r != 0) throw new InvalidOperationException($"cannot open the speaker device (MMSYSERR {r})");
         for (int i = 0; i < bufs.Headers.Length; i++)
         {
             WinMm.waveOutPrepareHeader(hwo, bufs.Headers[i], WaveBuffers.HeaderSize);
-            bufs.Write(i, new short[160]);
+            bufs.Write(i, new short[320]);
             WinMm.waveOutWrite(hwo, bufs.Headers[i], WaveBuffers.HeaderSize);
         }
         running = true;
@@ -232,7 +238,7 @@ public sealed class MicrophoneInput : IDisposable
             for (int i = 0; i < bufs.Headers.Length; i++)
             {
                 if (!bufs.Done(i)) continue;
-                var frame = bufs.Recorded(i) >= WaveBuffers.Bytes ? bufs.Read(i) : null;
+                var frame = bufs.Recorded(i) >= bufs.Bytes ? bufs.Read(i) : null;
                 bufs.ClearDone(i);
                 WinMm.waveInAddBuffer(hwi, bufs.Headers[i], WaveBuffers.HeaderSize);
                 if (frame != null) onFrame(frame);
@@ -254,4 +260,71 @@ public sealed class MicrophoneInput : IDisposable
         }
         bufs.Dispose();
     }
+}
+
+/// <summary>
+/// The console's speakers: the mixer's output 0 (selected audio and tones) on the main device and, when
+/// unselected audio has a device of its own, output 1 on that device. The main device's clock drives the
+/// mixer; the second device plays from a short queue so the two cannot drift apart by more than ~100 ms.
+/// </summary>
+public sealed class AudioEngine : IDisposable
+{
+    private readonly Mixer mixer;
+    private SpeakerOutput? main, second;
+    private readonly Queue<short[]> secondQueue = new();
+    private readonly object gate = new();
+    private static readonly short[] Silence = new short[320];
+
+    public AudioEngine(Mixer mixer) => this.mixer = mixer;
+
+    /// <summary>(Re)open the devices. Returns an error to show, or null.</summary>
+    public string? Start(string mainDevice, string secondDevice, bool separate)
+    {
+        Stop();
+        var outs = WinMm.OutputDevices();
+        string? err = null;
+        try
+        {
+            main = new SpeakerOutput(PullMain);
+            main.Start(WinMm.DeviceIndex(outs, mainDevice));
+        }
+        catch (Exception e) { err = $"Speaker: {e.Message}"; main = null; }
+        if (separate)
+        {
+            try
+            {
+                second = new SpeakerOutput(PullSecond);
+                second.Start(WinMm.DeviceIndex(outs, secondDevice));
+            }
+            catch (Exception e) { err = $"Unselect speaker: {e.Message}"; second = null; }
+        }
+        return err;
+    }
+
+    private short[] PullMain()
+    {
+        var f = mixer.PullStereo();
+        if (second != null)
+            lock (gate)
+            {
+                secondQueue.Enqueue(f[1]);
+                while (secondQueue.Count > 5) secondQueue.Dequeue();
+            }
+        return f[0];
+    }
+
+    private short[] PullSecond()
+    {
+        lock (gate) return secondQueue.Count > 0 ? secondQueue.Dequeue() : Silence;
+    }
+
+    public void Stop()
+    {
+        main?.Dispose();
+        second?.Dispose();
+        main = second = null;
+        lock (gate) secondQueue.Clear();
+    }
+
+    public void Dispose() => Stop();
 }
