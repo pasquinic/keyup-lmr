@@ -19,7 +19,7 @@ from lmrcommon.vocoder import VocoderPool
 
 from .api import router
 from .config import settings
-from .db import Base, engine, session_scope
+from .db import Base, engine, session_scope, upgrade_schema
 from .models import EdgeDevice, Site, SystemSetting, User, DEFAULT_SYSTEM_SETTINGS
 from .security import hash_secret, user_for_token, verify_secret
 from .services.call_controller import CallController, EdgeSession, VoiceProtocol
@@ -37,6 +37,7 @@ EDGE_SRC = os.getenv("EDGE_SRC_DIR", os.path.abspath(os.path.join(HERE, "..", ".
 
 def seed() -> None:
     Base.metadata.create_all(engine)
+    upgrade_schema(log)
     with session_scope() as db:
         if not db.query(User).count():
             db.add(User(username=settings.admin_user, password_hash=hash_secret(settings.admin_password)))
