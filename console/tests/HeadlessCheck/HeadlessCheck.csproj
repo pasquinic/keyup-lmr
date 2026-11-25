@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Runs the console's core (protocol client, mixer, activation, tunnel configuration) headless
+       against a live KeyUp server. Used by tests/lab_features_e2e.py; no UI, no NuGet packages. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/KeyUp.Console.Core/KeyUp.Console.Core.csproj" />
+  </ItemGroup>
+</Project>

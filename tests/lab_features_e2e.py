@@ -11,9 +11,12 @@ Checks:
     SIPREC (RFC 7866 metadata) and plain SIP to a simulated recorder with digest auth, retry on failure
   * dispatch console: activation (token + WireGuard tunnel), zones, monitoring several talkgroups,
     radio -> console audio, console talks over a radio (call priority), inhibit, patch, revoke
+  * the Windows console's own C# core (console/tests/HeadlessCheck, needs the .NET 8 SDK): activation,
+    encrypted settings, WireGuard configuration blob, G.711, monitoring, mixer output, PTT, inhibit
 """
 import asyncio
 import http.server
+import select
 import io
 import json
 import threading
@@ -256,6 +259,62 @@ async def console_checks():
             "radio, inhibit / uninhibit, patch / unpatch, revoke")
 
 
+def csharp_console_checks(tmp):
+    """The Windows console's C# core, headless, against this server."""
+    if not shutil.which("dotnet"):
+        return "SKIPPED (install the .NET 8 SDK to run the C# console check)"
+    out = f"{tmp}/headless"
+    b = subprocess.run(["dotnet", "build", "-c", "Release", "-o", out, "--configfile",
+                        f"{ROOT}/console/tests/HeadlessCheck/nuget.config", f"{ROOT}/console/tests/HeadlessCheck"],
+                       capture_output=True, text=True, timeout=600)
+    assert b.returncode == 0, b.stdout[-3000:]
+    ch = {c["name"]: c["id"] for c in req("GET", "/status", base=EDGE, auth=False)["channels"]}
+    con = req("POST", "/api/consoles", {"name": "Dispatch 2", "subscriber_id": 4004})
+    code = req("POST", f"/api/consoles/{con['id']}/activation", {})["code"]
+    p = subprocess.Popen(["dotnet", f"{out}/HeadlessCheck.dll", BASE, code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=open(f"{tmp}/headless.log", "w"), text=True, bufsize=1)
+
+    def line(timeout=30):
+        if not select.select([p.stdout], [], [], timeout)[0]:
+            raise AssertionError(f"C# check silent ({tmp}/headless.log)")
+        m = json.loads(p.stdout.readline())
+        assert m["event"] != "error", m
+        return m
+
+    def cmd(c, timeout=30):
+        p.stdin.write(c + "\n")
+        p.stdin.flush()
+        return line(timeout)
+    try:
+        a = line()
+        assert a["g711"] and a["store_ok"] and a["blob_ok"] and a["plan"] == ["wireguard", "https"], a
+        c = line()
+        assert c["refused"] is None and c["zones"] == ["Ops"] and c["rights"]["Inhibit"], c
+        cmd("monitor 100,300")
+        sim_key(ch["N-FD"], 1.5, 3003)
+        time.sleep(2.5)
+        rx = cmd("rx")
+        assert rx["frames"].get("100", 0) >= 60 and any(x["Src"] == 3003 for x in rx["calls"]), rx
+        assert rx["peak"] > 1000, rx
+        time.sleep(1)
+        before = edge_chan("N-FD")["voice_frames_played"]
+        t = cmd("talk 100 1.5")
+        assert t["result"] == "grant:100" and t["sent"] >= 70, t
+        time.sleep(1)
+        assert edge_chan("N-FD")["voice_frames_played"] - before >= 60
+        assert cmd("inhibit 3003 1")["result"] == "inhibit:3003:True:True"
+        assert cmd("inhibit 3003 0")["result"] == "inhibit:3003:False:True"
+        p.stdin.write("quit\n")
+        p.stdin.flush()
+    finally:
+        try:
+            p.wait(5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    return (f"G.711 bit-exact, DPAPI-style settings, {a['blob_bytes']}-byte WireGuardNT config, tunnel-first plan, "
+            f"heard radio 3003 ({rx['frames']['100']} frames, mixer peak {rx['peak']:.0f}), PTT, inhibit")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="keyup-features-")
     env = {**os.environ, "PYTHONPATH": f"{ROOT}:{ROOT}/central", "LMR_DATA_DIR": tmp,
@@ -298,6 +357,7 @@ def main():
         print(f"ok  PoC: {asyncio.run(poc_checks())}")
         print(f"ok  Recording: {recording_checks(tmp)}")
         print(f"ok  Dispatch console: {asyncio.run(console_checks())}")
+        print(f"ok  Windows console core (C#): {csharp_console_checks(tmp)}")
         print("\nALL FEATURE LAB TESTS PASSED")
     finally:
         for p in procs:

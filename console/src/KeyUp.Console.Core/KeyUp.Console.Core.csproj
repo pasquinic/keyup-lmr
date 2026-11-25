@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- KeyUp Dispatch Console: protocol, audio mixing, activation, settings and the WireGuard tunnel.
+       No package dependencies, so it builds (and its headless check runs) anywhere .NET 8 does. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>KeyUp.Console.Core</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <Version>1.0.0</Version>
+    <Company>KeyUp</Company>
+    <Product>KeyUp Dispatch Console</Product>
+    <Copyright>Copyright (C) 2026 KeyUp contributors. GPL-2.0.</Copyright>
+  </PropertyGroup>
+</Project>
