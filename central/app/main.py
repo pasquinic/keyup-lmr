@@ -72,7 +72,14 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(lambda: VoiceProtocol(state.ctl),
                                                        local_addr=(settings.voice_bind, settings.voice_port))
-    tasks = [asyncio.create_task(state.ctl.watchdog())]
+    from .services.recorder import Recorder
+    from .services.shipping import Shipper
+    state.recorder = Recorder(state.ctl)
+    state.ctl.recorder = state.recorder
+    state.ctl.refresh_names()
+    state.recorder.shipper = Shipper(state.recorder)
+    tasks = [asyncio.create_task(state.ctl.watchdog()), asyncio.create_task(state.recorder.housekeeping()),
+             asyncio.create_task(state.recorder.shipper.run())]
     from .services.poc import PocGateway
     state.poc = PocGateway(state.ctl)
     tasks.append(asyncio.create_task(state.poc.run()))

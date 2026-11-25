@@ -7,9 +7,15 @@ Checks:
   * zones: a phone gets its radio ID's zones, filtered by talkgroup rules
   * PoC phones (native router legs): phone -> radio and phone -> phone audio with the phone's radio
     ID, radio -> phone, busy / not-permitted denials, emergency priority, inhibit logs the phone out
+  * recording: per-call audio with talkers, WAV playback, CSV log export, shipping over HTTPS,
+    SIPREC (RFC 7866 metadata) and plain SIP to a simulated recorder with digest auth, retry on failure
 """
 import asyncio
+import http.server
+import io
 import json
+import threading
+import wave
 import os
 import shutil
 import subprocess
@@ -17,6 +23,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.request
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path[:0] = [ROOT, os.path.join(ROOT, "tests"), os.path.join(ROOT, "tools")]
@@ -106,6 +113,80 @@ async def poc_checks():
     return "phone->radio+phone as RID 1001, radio->phones, busy, emergency preempts a radio, restricted TG denied, inhibit logs out"
 
 
+def raw(path):
+    r = urllib.request.Request(BASE + path, headers={"authorization": f"Bearer {lab.TOKEN}"})
+    with urllib.request.urlopen(r, timeout=10) as resp:
+        return resp.read()
+
+
+class Sink(http.server.BaseHTTPRequestHandler):
+    posts = []
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("content-length", 0)))
+        Sink.posts.append({"auth": self.headers.get("authorization"), "ctype": self.headers.get("content-type"), "body": body})
+        self.send_response(201)
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+def recording_checks(tmp):
+    calls = req("GET", "/api/calls?recorded=true&limit=50")
+    call = max((c for c in calls if c["talkgroup_id"] == 100 and any(t["src"] == 1001 for t in c["talkers"])),
+               key=lambda c: c["recording_bytes"])
+    wav = wave.open(io.BytesIO(raw(f"/api/calls/{call['id']}/audio")))
+    secs = wav.getnframes() / wav.getframerate()
+    assert wav.getframerate() == 8000 and wav.getsampwidth() == 2 and secs >= 1.8, (secs, call)
+    assert call["talkers"][0]["alias"] == "E1" and call["recording"].endswith(".ul"), call
+    log = raw("/api/calls/export.csv?tg=100").decode()
+    assert "record,started_utc" in log and "E1 (1001)" in log, log[:300]
+
+    def ship(mode, target, **extra):
+        req("PUT", "/api/settings", {"recording_ship_mode": mode, "recording_ship_target": target, **extra})
+        req("POST", f"/api/calls/{call['id']}/ship", {})
+        wait(lambda: next(c for c in req("GET", "/api/calls?recorded=true&limit=50") if c["id"] == call["id"])["ship_status"]
+             not in ("queued",), 40, f"{mode} shipping")
+        return next(c for c in req("GET", "/api/calls?recorded=true&limit=50") if c["id"] == call["id"])["ship_status"]
+
+    # HTTPS (plain HTTP in the lab) upload
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 18199), Sink)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    st = ship("https", "http://127.0.0.1:18199/upload", recording_ship_token="t0k")
+    assert st == "sent" and Sink.posts, (st, Sink.posts[:1])
+    post = Sink.posts[-1]
+    assert post["auth"] == "Bearer t0k" and b'"talkgroup": 100' in post["body"] and b"RIFF" in post["body"], post["ctype"]
+    srv.shutdown()
+
+    # SIPREC and plain SIP to a recorder that requires digest auth
+    out = f"{tmp}/siprec.jsonl"
+    sim = subprocess.Popen([sys.executable, f"{ROOT}/tools/sip_recorder_sim.py", "--port", "15160", "--user", "rec",
+                            "--password", "secret", "--out", out])
+    try:
+        time.sleep(0.5)
+        st = ship("siprec", "sip:srs@127.0.0.1:15160", recording_ship_username="rec", recording_ship_password="secret")
+        assert st == "sent", st
+        got = [json.loads(line) for line in open(out)]
+        rec = got[-1]
+        frames = int(secs * 50)
+        assert rec["siprec"] and rec["require"] == "siprec" and "+sip.src" in rec["contact"], rec
+        assert 'k:talkgroup id="100" name="Fire"' in rec["metadata"] and "<name>E1</name>" in rec["metadata"], rec["metadata"]
+        assert rec["rtp_packets"] >= frames * 0.95, (rec["rtp_packets"], frames)
+        st = ship("sip", "sip:recorder@127.0.0.1:15160")
+        rec = [json.loads(line) for line in open(out)][-1]
+        assert st == "sent" and not rec["siprec"] and rec["x_headers"]["x-keyup-talkgroup"] == "100", rec
+        assert '"TG 100 Fire"' in rec["from"], rec["from"]
+        # a recorder that does not answer: the call is retried, not lost
+        st = ship("sip", "sip:recorder@127.0.0.1:15999")
+        assert st.startswith("retry:1"), st
+    finally:
+        sim.terminate()
+        req("PUT", "/api/settings", {"recording_ship_mode": "off"})
+    return (f"call recorded ({secs:.1f}s WAV, talkers logged, CSV export), shipped over HTTPS, SIPREC "
+            f"({rec['rtp_packets']} RTP packets + RFC 7865 metadata) and SIP with digest auth; failures retried")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="keyup-features-")
     env = {**os.environ, "PYTHONPATH": f"{ROOT}:{ROOT}/central", "LMR_DATA_DIR": tmp,
@@ -146,6 +227,7 @@ def main():
         except urllib.error.HTTPError as e:
             assert e.code == 403
         print(f"ok  PoC: {asyncio.run(poc_checks())}")
+        print(f"ok  Recording: {recording_checks(tmp)}")
         print("\nALL FEATURE LAB TESTS PASSED")
     finally:
         for p in procs:

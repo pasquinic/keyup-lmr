@@ -4,6 +4,7 @@ import csv
 import datetime as dt
 import io
 import json
+import os
 import secrets
 import threading
 import time
@@ -416,15 +417,91 @@ def enroll_status(body: dict, db: Session = Depends(get_db)):
 
 
 # ============================================================== calls & dashboard
-@router.get("/calls", dependencies=admin)
-def list_calls(limit: int = Query(100, le=1000), tg: int | None = None, site: int | None = None,
-               db: Session = Depends(get_db)):
+def _calls_query(db, tg=None, site=None, unit=None, since=None, until=None, recorded=False, result=None):
     q = db.query(CallRecord)
     if tg:
         q = q.filter(CallRecord.talkgroup_id == tg)
     if site:
         q = q.filter(CallRecord.source_site_id == site)
+    if unit:
+        q = q.filter((CallRecord.source_id == unit) | CallRecord.talkers.like(f'%"src": {int(unit)},%'))
+    if since:
+        q = q.filter(CallRecord.started_at >= since)
+    if until:
+        q = q.filter(CallRecord.started_at < until)
+    if recorded:
+        q = q.filter(CallRecord.recording != "")
+    if result == "granted":
+        q = q.filter(CallRecord.result.in_(["granted", "preempted"]))
+    elif result == "denied":
+        q = q.filter(CallRecord.result.like("denied:%"))
+    return q
+
+
+@router.get("/calls", dependencies=admin)
+def list_calls(limit: int = Query(100, le=1000), tg: int | None = None, site: int | None = None,
+               unit: int | None = None, since: dt.datetime | None = None, until: dt.datetime | None = None,
+               recorded: bool = False, result: str | None = None, db: Session = Depends(get_db)):
+    q = _calls_query(db, tg, site, unit, since, until, recorded, result)
     return [c.to_dict() for c in q.order_by(CallRecord.started_at.desc()).limit(limit)]
+
+
+@router.get("/calls/export.csv", dependencies=admin)
+def export_calls(tg: int | None = None, site: int | None = None, unit: int | None = None,
+                 since: dt.datetime | None = None, until: dt.datetime | None = None, recorded: bool = False,
+                 result: str | None = None, db: Session = Depends(get_db)):
+    """Talkgroup activity log as CSV (one row per call, talkers listed)."""
+    names = {t.id: t.name for t in db.query(TalkGroup).all()}
+    aliases = {s.id: s.alias for s in db.query(Subscriber).all()}
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["record", "started_utc", "ended_utc", "duration_s", "talkgroup", "talkgroup_name", "source_id",
+                "source_alias", "source_site", "result", "emergency", "talkers", "recording", "ship_status"])
+    q = _calls_query(db, tg, site, unit, since, until, recorded, result).order_by(CallRecord.started_at)
+    for c in q.limit(100000):
+        talkers = "; ".join(f"{t.get('alias') or t['src']} ({t['src']}) +{t['at']}s {t['dur']}s"
+                            for t in json.loads(c.talkers or "[]"))
+        w.writerow([c.id, c.started_at, c.ended_at or "", c.duration_s, c.talkgroup_id, names.get(c.talkgroup_id, ""),
+                    c.source_id, aliases.get(c.source_id, ""), c.source_site_id, c.result,
+                    "yes" if c.emergency else "", talkers, c.recording, c.ship_status])
+    return Response(buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": 'attachment; filename="keyup-call-log.csv"'})
+
+
+@router.get("/calls/{pk}/audio", dependencies=admin)
+def call_audio(pk: int, db: Session = Depends(get_db)):
+    """The call recording as a 16-bit PCM WAV (mu-law recordings) or the raw voice-frame file."""
+    from .services.recorder import Recorder
+    rec = _get_or_404(db, CallRecord, pk)
+    path = Recorder.path_of(rec)
+    if not path:
+        raise HTTPException(404, rec.recording_note or "no recording for this call")
+    if path.endswith(".ul"):
+        return Response(Recorder.wav_bytes(path), media_type="audio/wav",
+                        headers={"Content-Disposition": f'inline; filename="call-{pk}-tg{rec.talkgroup_id}.wav"'})
+    with open(path, "rb") as f:
+        return Response(f.read(), media_type="application/octet-stream",
+                        headers={"Content-Disposition": f'attachment; filename="{os.path.basename(path)}"'})
+
+
+@router.post("/calls/{pk}/ship", dependencies=admin)
+def call_reship(pk: int, db: Session = Depends(get_db)):
+    rec = _get_or_404(db, CallRecord, pk)
+    if not rec.recording:
+        raise HTTPException(409, "this call has no recording")
+    rec.ship_status = "queued"
+    db.commit()
+    if state.recorder and state.recorder.shipper:
+        state.recorder.shipper.next_try.pop(pk, None)
+        state.recorder.shipper.wake()
+    return {"ok": True}
+
+
+@router.get("/recording/status", dependencies=admin)
+def recording_status():
+    if not state.recorder:
+        return {"enabled": False}
+    return {**state.recorder.usage(), "shipping": state.recorder.shipper.status() if state.recorder.shipper else {}}
 
 
 @router.post("/sip/originate", dependencies=admin)

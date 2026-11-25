@@ -342,7 +342,7 @@ class CallRecord(DictMixin, Base):
     recording: Mapped[str] = mapped_column(String(256), default="")   # file under the recordings folder
     recording_bytes: Mapped[int] = mapped_column(Integer, default=0)
     recording_note: Mapped[str] = mapped_column(String(128), default="")  # e.g. why there is no audio
-    ship_status: Mapped[str] = mapped_column(String(16), default="")      # ""|queued|sent|failed:<why>
+    ship_status: Mapped[str] = mapped_column(String(160), default="")     # ""|queued|sent|retry:N|failed:<why>
     shipped_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     def to_dict(self):

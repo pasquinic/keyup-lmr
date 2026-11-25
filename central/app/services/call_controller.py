@@ -122,6 +122,7 @@ class Call:
     record_id: int | None = None
     seq: int = 0
     linked: frozenset = frozenset()      # talkgroups this call holds the floor on (patches)
+    dest_codecs: dict[str, set] = field(default_factory=dict)  # endpoint key -> codecs (packet channels)
     parrot: list | None = None           # recorded (codec, payload) frames to echo back
 
     def summary(self, ctl: "CallController") -> dict:
@@ -155,6 +156,7 @@ class CallController:
         self.affiliations = Affiliations()
         self.aff_timeout = 1800.0
         self._parrot_ids = itertools.count(1)
+        self.recorder = None   # services/recorder.Recorder, set by main
 
     @property
     def sip_legs(self) -> dict[str, Endpoint]:   # older name, used by the SIP gateway
@@ -181,7 +183,10 @@ class CallController:
                                     "parrot": t.parrot, "restricted": t.restricted} for t in tgs}
             self.unit_aliases = {s.id: s.alias for s in db.query(Subscriber).all()}
             self.links = link_groups([p.to_dict() for p in db.query(TalkgroupPatch).all()])
-            self.aff_timeout = float(get_system_settings(db).get("affiliation_timeout_s", 1800))
+            sysset = get_system_settings(db)
+            self.aff_timeout = float(sysset.get("affiliation_timeout_s", 1800))
+        if self.recorder is not None:
+            self.recorder.refresh(sysset)
 
     def linked(self, tg: int) -> frozenset[int]:
         return self.links.get(tg, frozenset({tg}))
@@ -514,6 +519,11 @@ class CallController:
         for t in call.linked | {call.tg}:
             if self.tg_calls.get(t) == call_id:
                 del self.tg_calls[t]
+        if self.recorder is not None:
+            try:
+                self.recorder.call_ended(call)
+            except Exception:
+                log.exception("recording of call %d failed to close", call_id)
         transcoded = self.transcoder.close(call_id)
         for key in call.dests:
             ep = self.endpoint(key)
@@ -615,13 +625,17 @@ class CallController:
         for key in call.dests:
             ep = self.endpoint(key)
             if ep:
-                targets.setdefault(ep.codec, []).append(ep)
-        if not targets:
+                for codec in self.dest_codecs(call, key, ep):
+                    targets.setdefault(codec, []).append(ep)
+        recording = self.recorder is not None and self.recorder.wants(call)
+        if not targets and not recording:
             return
         flags = frame.flags | (Flags.EMERGENCY if call.emergency else 0)
         if frame.payload:
             ts = self.transcoder.session(call.call_id, frame.codec)
-            converted = ts.convert(frame.payload, set(targets))
+            converted = ts.convert(frame.payload, set(targets) | ({Codec.ULAW} if recording else set()))
+            if recording:
+                self.recorder.frame(call, frame, converted.get(Codec.ULAW))
         else:
             converted = {c: b"" for c in targets}
         for codec, eps in targets.items():
@@ -632,6 +646,10 @@ class CallController:
             for ep in eps:
                 ep.send_frame(out)
                 self.stats["frames_routed"] += 1
+
+    def dest_codecs(self, call: Call, key: str, ep: Endpoint) -> set[Codec]:
+        """Codecs an endpoint gets for this call (an edge may take one stream per channel codec)."""
+        return call.dest_codecs.get(key) or {ep.codec}
 
     def on_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
         try:

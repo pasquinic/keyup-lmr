@@ -539,15 +539,70 @@ pages.network = async el => {
 
 pages.calls = async el => {
   const q = new URLSearchParams(location.hash.split("?")[1] || "");
-  const rows = await api(`/calls?limit=300${q.get("tg") ? "&tg=" + q.get("tg") : ""}${q.get("site") ? "&site=" + q.get("site") : ""}`);
-  el.innerHTML = `<div class="toolbar"><input id="fTg" placeholder="TG" value="${esc(q.get("tg") || "")}" style="width:100px"><input id="fSite" placeholder="Site" value="${esc(q.get("site") || "")}" style="width:100px"><button class="btn" id="fGo">Filter</button></div>
-  <div class="card tablewrap"><table><thead><tr><th>Start</th><th>TG</th><th>Source</th><th>Site</th><th>Duration</th><th>Destinations</th><th>Codec</th><th>Flags</th><th>Result</th></tr></thead><tbody>
-  ${rows.map(c => `<tr><td>${new Date(c.started_at).toLocaleString()}</td><td>${esc(c.talkgroup_id)}</td><td>${esc(c.source_id || "—")}</td><td>${esc(c.source_site_id || (c.via_sip ? "SIP" : "—"))}</td>
-    <td class="mono">${dur(c.duration_s)}</td><td class="muted">${esc(c.dest_sites.join(", "))}</td><td>${esc(c.source_codec)}</td>
+  const filt = new URLSearchParams();
+  for (const k of ["tg", "site", "unit", "result"]) if (q.get(k)) filt.set(k, q.get(k));
+  for (const k of ["since", "until"]) if (q.get(k)) filt.set(k, new Date(q.get(k)).toISOString().slice(0, 19));  // local -> UTC
+  if (q.get("recorded") === "1") filt.set("recorded", "true");
+  const [rows, rs] = await Promise.all([api(`/calls?limit=300&${filt}`), api("/recording/status").catch(() => ({}))]);
+  const ship = rs.shipping || {};
+  const shipPill = c => !c.ship_status ? "" : c.ship_status === "sent" ? pill("shipped", "yes") : c.ship_status === "queued" ? pill("queued", "mode")
+    : c.ship_status.startsWith("retry") ? pill(c.ship_status, "warn") : `<span title="${esc(c.ship_status)}">${pill("ship failed", "denied")}</span>`;
+  const talkers = c => (c.talkers || []).map(t => `${esc(t.alias || t.src)} <span class="muted">(${esc(t.src)}) +${t.at}s</span>`).join("<br>");
+  el.innerHTML = `<div class="card" style="margin-bottom:12px"><div class="toolbar" style="flex-wrap:wrap;gap:6px">
+      <input id="fTg" placeholder="TG" value="${esc(q.get("tg") || "")}" style="width:80px">
+      <input id="fSite" placeholder="Site" value="${esc(q.get("site") || "")}" style="width:70px">
+      <input id="fUnit" placeholder="Radio ID" value="${esc(q.get("unit") || "")}" style="width:100px">
+      <label class="muted">From <input id="fSince" type="datetime-local" value="${esc(q.get("since") || "")}"></label>
+      <label class="muted">To <input id="fUntil" type="datetime-local" value="${esc(q.get("until") || "")}"></label>
+      <select id="fRes"><option value="">All results</option><option value="granted" ${q.get("result") === "granted" ? "selected" : ""}>Calls</option><option value="denied" ${q.get("result") === "denied" ? "selected" : ""}>Denials</option></select>
+      <label class="check"><input type="checkbox" id="fRec" ${q.get("recorded") === "1" ? "checked" : ""}> Recorded only</label>
+      <button class="btn" id="fGo">Filter</button><button class="btn" id="fCsv">Export CSV</button></div>
+    <p class="muted" style="margin:6px 0 0">Recording ${rs.enabled ? "on" : "off"} · ${esc(rs.files ?? 0)} files · ${((rs.bytes || 0) / 1048576).toFixed(1)} MB
+      · shipping ${esc(ship.mode || "off")}${ship.target ? " → " + esc(ship.target) : ""}${ship.last_error ? ` · last error: ${esc(ship.last_error)}` : ""}</p>
+    <audio id="player" controls style="width:100%;margin-top:8px;display:none"></audio></div>
+  <div class="card tablewrap"><table><thead><tr><th>Start</th><th>TG</th><th>Talkers</th><th>Site</th><th>Duration</th><th>Destinations</th><th>Flags</th><th>Result</th><th>Recording</th></tr></thead><tbody>
+  ${rows.map(c => `<tr><td>${new Date(c.started_at).toLocaleString()}</td><td>${esc(c.talkgroup_id)}</td>
+    <td>${talkers(c) || esc(c.source_id || "—")}</td><td>${esc(c.source_site_id || (c.via_sip ? "SIP" : "—"))}</td>
+    <td class="mono">${dur(c.duration_s)}</td><td class="muted">${esc(c.dest_sites.join(", "))}</td>
     <td>${c.emergency ? pill("EMERG", "emerg") : ""} ${c.transcoded ? pill("xcode", "mode") : ""} ${c.site_trunking ? pill("site trunking", "warn") : ""} ${c.via_sip ? pill("sip", "mode") : ""}</td>
-    <td>${pill(c.result.split(":")[0], c.result.startsWith("denied") ? "denied" : c.result === "granted" ? "granted" : "warn")} <span class="muted">${esc(c.result.split(":")[1] || "")}</span></td></tr>`).join("") || `<tr><td colspan="9" class="empty">No calls</td></tr>`}
+    <td>${pill(c.result.split(":")[0], c.result.startsWith("denied") ? "denied" : c.result === "granted" ? "granted" : "warn")} <span class="muted">${esc(c.result.split(":")[1] || "")}</span></td>
+    <td class="actions">${c.recording ? (c.recording.endsWith(".ul") ? `<button class="btn sm" data-play="${c.id}">▶ Play</button> ` : "") + `<button class="btn sm ghost" data-dl="${c.id}">Download</button> ${shipPill(c)}`
+      + (c.ship_status && c.ship_status !== "sent" && c.ship_status !== "queued" ? ` <button class="btn sm ghost" data-ship="${c.id}">Retry</button>` : "")
+      : `<span class="muted">${esc(c.recording_note || "—")}</span>`}</td></tr>`).join("") || `<tr><td colspan="9" class="empty">No calls</td></tr>`}
   </tbody></table></div>`;
-  $("#fGo", el).onclick = () => location.hash = `#/calls?tg=${$("#fTg").value}&site=${$("#fSite").value}`;
+  const params = () => {
+    const p = new URLSearchParams();
+    const set = (k, v) => v && p.set(k, v);
+    set("tg", $("#fTg").value.trim()); set("site", $("#fSite").value.trim()); set("unit", $("#fUnit").value.trim());
+    set("since", $("#fSince").value); set("until", $("#fUntil").value); set("result", $("#fRes").value);
+    if ($("#fRec").checked) p.set("recorded", "1");
+    return p;
+  };
+  $("#fGo", el).onclick = () => location.hash = `#/calls?${params()}`;
+  const blob = async path => { const r = await fetch("/api" + path, {headers: {Authorization: "Bearer " + TOKEN}}); if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText); return r; };
+  $("#fCsv", el).onclick = async () => {
+    const p = params(); if (p.get("recorded")) p.set("recorded", "true");
+    for (const k of ["since", "until"]) if (p.get(k)) p.set(k, new Date(p.get(k)).toISOString().slice(0, 19));
+    const r = await blob(`/calls/export.csv?${p}`);
+    const url = URL.createObjectURL(await r.blob());
+    Object.assign(document.createElement("a"), {href: url, download: "keyup-call-log.csv"}).click();
+    URL.revokeObjectURL(url);
+  };
+  el.onclick = async e => {
+    const {play, dl, ship: reship} = e.target.dataset;
+    try {
+      if (play) {
+        const pl = $("#player"); const r = await blob(`/calls/${play}/audio`);
+        if (pl.src) URL.revokeObjectURL(pl.src);
+        pl.src = URL.createObjectURL(await r.blob()); pl.style.display = "block"; await pl.play();
+      } else if (dl) {
+        const r = await blob(`/calls/${dl}/audio`);
+        const name = (r.headers.get("content-disposition") || "").match(/filename="([^"]+)"/)?.[1] || `call-${dl}.wav`;
+        const url = URL.createObjectURL(await r.blob());
+        Object.assign(document.createElement("a"), {href: url, download: name}).click(); URL.revokeObjectURL(url);
+      } else if (reship) { await api(`/calls/${reship}/ship`, {method: "POST"}); toast("Queued for shipping"); route(); }
+    } catch (err) { toast(err.message, true); }
+  };
 };
 
 pages.settings = async el => {
@@ -555,8 +610,13 @@ pages.settings = async el => {
   const labels = {system_name: "System name", wacn: "WACN (hex)", system_id: "System ID (hex)", require_known_subscriber: "Require known subscriber (true/false)",
     site_trunking_timeout_s: "Site trunking after link loss (s)", site_trunking_announce_interval_s: "Site trunking re-announce interval (s)",
     site_trunking_message: "Site trunking data message", wide_area_message: "Wide-area restored message", default_hang_time_ms: "Default hang time (ms)", max_call_s: "Max call duration (s)",
-    affiliation_timeout_s: "Affiliation timeout (s)", cw_id_interval_s: "CW ID interval per transmitter (s)", parrot_delay_ms: "Parrot echo delay (ms)"};
-  el.innerHTML = `<div class="grid two"><div class="card"><h3>System</h3><form id="sForm" class="formgrid">${Object.entries(s).map(([k, v]) => `<label>${esc(labels[k] || k)}<input name="${esc(k)}" value="${esc(v)}"></label>`).join("")}
+    affiliation_timeout_s: "Affiliation timeout (s)", cw_id_interval_s: "CW ID interval per transmitter (s)", parrot_delay_ms: "Parrot echo delay (ms)",
+    recording_enabled: "Record talkgroup audio (true/false; per-talkgroup switch too)", recording_retention_days: "Keep recordings (days)",
+    recording_max_gb: "Recording storage limit (GB, oldest deleted first)", recording_ship_mode: "Ship recordings: off | https | sip | siprec",
+    recording_ship_target: "Ship to (https: URL · sip/siprec: sip:recorder@host:port)", recording_ship_transport: "SIP transport (udp | tcp)",
+    recording_ship_username: "SIP auth username", recording_ship_password: "SIP auth password", recording_ship_token: "HTTPS bearer token"};
+  const secret = k => /password|token/.test(k);
+  el.innerHTML = `<div class="grid two"><div class="card"><h3>System</h3><form id="sForm" class="formgrid">${Object.entries(s).map(([k, v]) => `<label>${esc(labels[k] || k)}<input name="${esc(k)}" value="${esc(v)}" ${secret(k) ? 'type="password" autocomplete="new-password"' : ""}></label>`).join("")}
     <div class="wide"><button class="btn primary">Save &amp; push to sites</button></div></form></div>
     <div class="card"><h3>Change password</h3><form id="pForm" class="formgrid"><label class="wide">Current<input type="password" name="old"></label><label class="wide">New (8+ chars)<input type="password" name="new"></label><div><button class="btn">Update</button></div></form></div></div>`;
   $("#sForm").onsubmit = async e => { e.preventDefault(); try { await api("/settings", {method: "PUT", body: Object.fromEntries(new FormData(e.target))}); toast("Settings saved and pushed to edges"); } catch (err) { toast(err.message, true); } };
@@ -565,7 +625,7 @@ pages.settings = async el => {
 
 // ------------------------------------------------------------------ router
 const TITLES = {zones: "Zones", poc: "PoC Phones (Cellular Subscribers)", network: "Network", bandplan: "Band Plan", patches: "Talkgroup Patches", dashboard: "Dashboard", sites: "Sites", devices: "Edge Devices & Enrollment", channels: "Channels & Frequency Plan", talkgroups: "Talkgroups",
-  subscribers: "Subscriber Radios", sip: "SIP Interconnect", calls: "Call History", settings: "System Settings"};
+  subscribers: "Subscriber Radios", sip: "SIP Interconnect", calls: "Call History & Recordings", settings: "System Settings"};
 async function route() {
   const page = (location.hash.slice(2).split("?")[0]) || "dashboard";
   document.querySelectorAll("aside nav a").forEach(a => a.classList.toggle("active", a.dataset.page === page));
